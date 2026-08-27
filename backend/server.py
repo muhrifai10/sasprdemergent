@@ -1901,6 +1901,19 @@ app.add_middleware(
 )
 
 
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 404:
+            response = await super().get_response("index.html", scope)
+        return response
+
+
+FRONTEND_DIST = ROOT_DIR / "frontend_dist"
+if FRONTEND_DIST.exists():
+    app.mount("/", SPAStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+
+
 @app.on_event("startup")
 async def ensure_indexes():
     await asyncio.gather(
