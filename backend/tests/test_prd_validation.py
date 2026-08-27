@@ -1368,3 +1368,123 @@ def test_valid_content_no_repair(monkeypatch):
     out, diag = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
     assert diag["attempts"] == 0
     assert not called
+
+
+# ---------- Phase 5: provider fallback consistency ----------
+
+def _run_generation_job(monkeypatch, project, attempts, fail_first, bad_fallback=False):
+    class _Col:
+        def __init__(self, doc):
+            self._doc = doc
+        async def find_one(self, *a, **k):
+            return self._doc
+        async def count_documents(self, *a, **k):
+            return 0
+        async def insert_one(self, *a, **k):
+            return None
+        async def update_one(self, *a, **k):
+            return None
+
+    class _Db:
+        def __init__(self):
+            self.prd_documents = _Col(None)
+            self.projects = _Col(None)
+            self.usage_records = _Col(None)
+    monkeypatch.setattr(server, "db", _Db())
+    async def fake_attempts(*a, **k):
+        return attempts
+    monkeypatch.setattr(server, "build_ai_attempts", fake_attempts)
+
+    calls = []
+    validate_calls = []
+    monkeypatch.setattr(server, "validate_prd_consistency", lambda content: validate_calls.append(content))
+
+    async def fake_stream(provider, api_key, base_url, model, project, language, system_msg, user_msg):
+        calls.append((provider, (project.get("_frozen_context") or {}).copy()))
+        if fail_first and provider == attempts[0][0]:
+            raise RuntimeError("provider A down")
+        for i, heading in enumerate(REQUIRED_PRD_HEADINGS):
+            body = ("Payment via Stripe." if bad_fallback and i == 8 else "Concrete implementation details.")
+            yield f"{heading}\n\n{body}"
+    monkeypatch.setattr(server, "stream_prd", fake_stream)
+
+    repair_calls = []
+    async def fake_repair(content, project, provider, api_key, base_url, model, language):
+        repair_calls.append(provider)
+        return content, {"attempts": 0}
+    monkeypatch.setattr(server, "run_repair_if_needed", fake_repair)
+
+    server.GENERATION_JOBS["test-job"] = {"status": "running", "content": "", "error": None, "user_id": "user"}
+    asyncio.run(server.run_generation_job(
+        "test-job", "prd", project, {"user_id": "user"}, server.PRD_SYSTEM, "prompt", "id"))
+    job = server.GENERATION_JOBS.pop("test-job")
+    return calls, repair_calls, validate_calls, job
+
+
+_ds = ("deepseek", "m2", "k2", "u2")
+
+
+def test_phase5_primary_success_uses_only_primary(monkeypatch):
+    attempts = [("9router", "m1", "k1", "u1"), _ds]
+    calls, repair, validate, job = _run_generation_job(monkeypatch, {"id": "p1", "name": "X"}, attempts, fail_first=False)
+    assert [c[0] for c in calls] == ["9router"]
+    assert job["status"] == "completed"
+
+
+def test_phase5_fallback_used_when_primary_fails(monkeypatch):
+    attempts = [("9router", "m1", "k1", "u1"), _ds]
+    calls, repair, validate, job = _run_generation_job(monkeypatch, {"id": "p1", "name": "X"}, attempts, fail_first=True)
+    assert [c[0] for c in calls] == ["9router", "deepseek"]
+    assert job["status"] == "completed"
+
+
+def test_phase5_fallback_receives_same_frozen_context(monkeypatch):
+    attempts = [("9router", "m1", "k1", "u1"), _ds]
+    calls, _, _, _ = _run_generation_job(monkeypatch, {"id": "p1", "name": "X"}, attempts, fail_first=True)
+    assert calls[0][1] == calls[1][1]
+    assert calls[0][1].get("frozen") and calls[0][1].get("rules")
+
+
+def test_phase5_canonical_unchanged_by_fallback(monkeypatch):
+    project = {"id": "p1", "name": "SaaS", "product_type": "SaaS", "description": "CRM",
+               "preferred_technology": "Next.js + PostgreSQL", "payment_requirement": "Midtrans"}
+    before = server.build_canonical_spec(project).model_dump()
+    before_decisions = server.canonical_project_decisions(project)
+    attempts = [("9router", "m1", "k1", "u1"), _ds]
+    _run_generation_job(monkeypatch, project, attempts, fail_first=True)
+    assert server.build_canonical_spec(project).model_dump() == before
+    assert server.canonical_project_decisions(project) == before_decisions
+
+
+def test_phase5_anti_drift(monkeypatch):
+    canon = {"id": "p1", "name": "SaaS", "product_type": "SaaS", "description": "SaaS analytics",
+             "preferred_technology": "Next.js + PostgreSQL", "payment_requirement": "Midtrans",
+             "integrations": "S3", "deployment_preference": "AWS ECS"}
+    attempts = [("9router", "m1", "k1", "u1"), _ds]
+    calls, _, _, _ = _run_generation_job(monkeypatch, canon, attempts, fail_first=True)
+    spec = server.build_canonical_spec(canon)
+    assert spec.payments == "Midtrans" and spec.storage == "AWS S3"
+    assert "AWS ECS" in spec.infrastructure and "PostgreSQL" in spec.database
+    assert spec.domain == "generic"
+    # The frozen context given to provider B must carry the canonical values, never alternatives.
+    ctx = calls[1][1]
+    frozen = (ctx.get("frozen") or "").lower()
+    rules = (ctx.get("rules") or "").lower()
+    assert "midtrans" in frozen and "s3" in frozen and "aws ecs" in frozen and "postgresql" in frozen
+    assert "stripe" not in frozen and "cloudinary" not in frozen and "mariadb" not in frozen
+    # Domain gating: generic SaaS => commerce order lifecycle must be absent from the rules.
+    assert "shipped" not in rules and "delivered" not in rules and "model a" not in rules
+
+
+def test_phase5_fallback_output_validated(monkeypatch):
+    attempts = [("9router", "m1", "k1", "u1"), _ds]
+    calls, repair, validate, _ = _run_generation_job(monkeypatch, {"id": "p1", "name": "X"}, attempts, fail_first=True)
+    assert validate, "fallback output must go through validation"
+
+
+def test_phase5_fallback_output_can_enter_repair(monkeypatch):
+    attempts = [("9router", "m1", "k1", "u1"), _ds]
+    canon = {"id": "p1", "name": "Toko", "product_type": "E-Commerce", "payment_requirement": "Midtrans"}
+    calls, repair, validate, _ = _run_generation_job(monkeypatch, canon, attempts, fail_first=True, bad_fallback=True)
+    assert repair, "fallback output with conflicts must reach the repair loop"
+    assert repair[-1] == "deepseek"

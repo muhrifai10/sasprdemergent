@@ -1499,7 +1499,9 @@ def prd_chunk_user_prompt(project: dict, language: str, start: int, end: int) ->
     lang = "Bahasa Indonesia" if language == "id" else "English"
     sections = "\n".join(REQUIRED_PRD_HEADINGS[start:end])
     guidance = "\n".join(f"{heading}: {PRD_SECTION_GUIDANCE[heading]}" for heading in REQUIRED_PRD_HEADINGS[start:end])
-    frozen = canonical_project_decisions(project)
+    _fc = project.get("_frozen_context") or {}
+    frozen = _fc.get("frozen") or canonical_project_decisions(project)
+    rules = _fc.get("rules") or canonical_mvp_decisions(project)
     dep = render_dependency_context(project.get("_dependency_context")) if project.get("_dependency_context") else ""
     if end - start == 1:
         word_limit = 600 if start in {5, 6} else 350 if start == 8 else 220
@@ -1512,6 +1514,8 @@ FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT
 {frozen}
 
 {canonical_mvp_decisions(project)}
+
+{rules}
 
 {dep}
 Write only the body for this section:
@@ -1530,6 +1534,8 @@ FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT
 {frozen}
 
 {canonical_mvp_decisions(project)}
+
+{rules}
 
 {dep}
 Return only these sections, with each heading exactly once and in this order:
@@ -1622,6 +1628,13 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
         if not attempts:
             raise RuntimeError("No AI provider is configured")
         provider_used, model_used = attempts[0][0], attempts[0][1]
+        # Phase 5: freeze the generation context ONCE, before any provider runs, so a
+        # fallback provider receives the IDENTICAL canonical spec + domain rules, never a
+        # rebuild from the raw project input. Deterministic, immutable, no drift.
+        project.setdefault("_frozen_context", {
+            "frozen": render_canonical_spec(build_canonical_spec(project)),
+            "rules": canonical_mvp_decisions(project),
+        })
 
         for index, (provider, model, api_key, base_url) in enumerate(attempts):
             provider_used, model_used = provider, model
@@ -1655,7 +1668,7 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
                 break
             except Exception as error:
                 if index < len(attempts) - 1:
-                    logger.warning("AI provider %s unavailable; retrying with %s", provider, attempts[index + 1][0])
+                    logger.warning("AI provider %s unavailable; retrying with %s (reason: %s)", provider, attempts[index + 1][0], str(error)[:200])
                     continue
                 raise
 
