@@ -1570,3 +1570,162 @@ def test_phase6_numeric_different_units_not_compared():
     content = _prd({3: "Timeout 120 detik. Retensi 180 hari."})
     r = server.analyze_prd_consistency(content)
     assert not any("Numeric business value inconsistent" in m for m in r["medium"])
+
+
+# ---------- Phase 7: targeted benchmark hardening ----------
+
+def test_phase7_db_postgres_vs_postgresql_same():
+    content = _prd({5: "Database: PostgreSQL.", 9: "Deploy with postgres."})
+    assert not any("Database uses" in c for c in server.analyze_prd_consistency(content)["critical"])
+
+
+def test_phase7_db_postgresql_vs_postgres_same():
+    content = _prd({5: "Database: postgresql.", 9: "postgres engine."})
+    assert not any("Database uses" in c for c in server.analyze_prd_consistency(content)["critical"])
+
+
+def test_phase7_db_postgres_vs_mongodb_conflict():
+    content = _prd({5: "Database: PostgreSQL.", 9: "MongoDB engine."})
+    assert any("Database uses" in c for c in server.analyze_prd_consistency(content)["critical"])
+
+
+def test_phase7_db_postgres_vs_mysql_conflict():
+    content = _prd({5: "Database: PostgreSQL.", 9: "MySQL engine."})
+    assert any("Database uses" in c for c in server.analyze_prd_consistency(content)["critical"])
+
+
+def test_phase7_canonical_db_normalized():
+    assert server.build_canonical_spec({"name": "X", "preferred_technology": "postgres"}).database == "PostgreSQL"
+    assert server.build_canonical_spec({"name": "X", "preferred_technology": "PostgreSQL"}).database == "PostgreSQL"
+    assert server.build_canonical_spec({"name": "X", "preferred_technology": "MySQL"}).database == "MySQL"
+
+
+def test_phase7_no_provider_examples_in_global_rules():
+    rules = server.canonical_mvp_decisions({"name": "X", "product_type": "SaaS"}).lower()
+    for p in ("vercel", "neon", "cloudinary", "heroku", "railway"):
+        assert p not in rules, f"{p} leaked into global rules"
+    assert "undetermined" in rules or "tbd" in rules
+
+
+def test_phase7_no_infra_auto_selected():
+    spec = server.build_canonical_spec({"name": "X", "preferred_technology": "Next.js + PostgreSQL"})
+    assert spec.infrastructure == "" and spec.storage == "" and spec.payments == ""
+
+
+def test_phase7_explicit_vercel_allowed():
+    spec = server.build_canonical_spec({"name": "X", "preferred_technology": "Next.js + PostgreSQL", "deployment_preference": "Vercel"})
+    assert "Vercel" in spec.infrastructure
+
+
+def test_phase7_no_storage_auto():
+    assert server.build_canonical_spec({"name": "X", "preferred_technology": "PostgreSQL"}).storage == ""
+
+
+def test_phase7_no_payment_auto():
+    assert server.build_canonical_spec({"name": "X", "preferred_technology": "Next.js"}).payments == ""
+
+
+def test_phase7_single_section_strips_duplicate_heading(monkeypatch):
+    async def fake(*a, **k):
+        yield "### 7. API Specification\n\nPOST /api/orders returns 201.\n"
+    monkeypatch.setattr(server, "stream_openai_compatible", fake)
+    out = asyncio.run(server.generate_prd_chunk("9router", "k", "u", "m", {}, "id", 6, 7))
+    assert out.count("## 7. API Specification") == 1
+    assert "### 7. API Specification" not in out
+    assert "POST /api/orders" in out
+
+
+def test_phase7_single_section_preserves_subheadings(monkeypatch):
+    async def fake(*a, **k):
+        yield "### 7. API Specification\n#### 7.1 Workspace\nPOST /api/workspace\n"
+    monkeypatch.setattr(server, "stream_openai_compatible", fake)
+    out = asyncio.run(server.generate_prd_chunk("9router", "k", "u", "m", {}, "id", 6, 7))
+    assert out.count("## 7. API Specification") == 1
+    assert "### 7. API Specification" not in out
+    assert "#### 7.1" in out
+
+
+def test_phase7_realtime_in_nongoals_not_flagged():
+    content = _prd({1: "Non-goals: chat real-time (future).", 3: "FR-1 workspace."})
+    assert not any("real-time" in m for m in server.analyze_prd_consistency(content)["medium"])
+
+
+def test_phase7_realtime_as_feature_flagged():
+    content = _prd({4: "FR-1 real-time updates."})
+    assert any("real-time" in m for m in server.analyze_prd_consistency(content)["medium"])
+
+
+# ---------- D0.1: discovery state foundation + generation guard ----------
+
+def test_d0_default_discovery_status_none(monkeypatch):
+    class _Col:
+        async def count_documents(self, *a, **k):
+            return 0
+        async def insert_one(self, doc):
+            return None
+    class _Db:
+        def __init__(self):
+            self.projects = _Col()
+    monkeypatch.setattr(server, "db", _Db())
+    doc = asyncio.run(server.create_project(server.ProjectCreate(name="X", description="my idea"), {"user_id": "u1", "plan": "free"}))
+    assert doc["discovery_status"] == "none"
+    assert doc["discovery"]["idea"] == "my idea"
+    assert doc["discovery"]["questions"] == [] and doc["discovery"]["answers"] == {}
+    assert doc["discovery"]["confirmed_at"] is None
+
+
+def test_d0_transition_none_to_in_progress():
+    assert server.transition_discovery_status("none", "in_progress") == "in_progress"
+
+
+def test_d0_transition_in_progress_to_awaiting():
+    assert server.transition_discovery_status("in_progress", "awaiting_confirmation") == "awaiting_confirmation"
+
+
+def test_d0_transition_awaiting_to_confirmed():
+    assert server.transition_discovery_status("awaiting_confirmation", "confirmed") == "confirmed"
+
+
+def test_d0_invalid_transition_rejected():
+    for cur, new in (("none", "confirmed"), ("confirmed", "in_progress"), ("in_progress", "confirmed"), ("none", "unknown")):
+        with pytest.raises(ValueError):
+            server.transition_discovery_status(cur, new)
+
+
+def test_d0_generate_blocked_when_none(monkeypatch):
+    calls = _mock_generation_env(monkeypatch, {"name": "X", "discovery_status": "none"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert e.value.status_code == 400
+    assert calls == []
+
+
+def test_d0_generate_blocked_when_in_progress(monkeypatch):
+    calls = _mock_generation_env(monkeypatch, {"name": "X", "discovery_status": "in_progress"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert e.value.status_code == 400
+    assert calls == []
+
+
+def test_d0_generate_blocked_when_awaiting_confirmation(monkeypatch):
+    calls = _mock_generation_env(monkeypatch, {"name": "X", "discovery_status": "awaiting_confirmation"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert e.value.status_code == 400
+    assert calls == []
+
+
+def test_d0_generate_allowed_when_confirmed(monkeypatch):
+    calls = _mock_generation_env(monkeypatch, {"name": "X", "discovery_status": "confirmed"})
+    out = asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert out["job_id"] == "JOB-1"
+    assert calls
+
+
+def test_d0_legacy_project_generates(monkeypatch):
+    # Project without discovery_status (created before discovery existed) => treated as confirmed.
+    calls = _mock_generation_env(monkeypatch, {"name": "X"})
+    out = asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert out["job_id"] == "JOB-1"
+    assert calls

@@ -416,6 +416,11 @@ _HASH_RE = re.compile(r"\b(argon2id|argon2|bcrypt|bycrypt|pbkdf2|scrypt)\b", re.
 _DB_CANON = {"postgres": "PostgreSQL", "postgresql": "PostgreSQL", "mysql": "MySQL",
              "mariadb": "MariaDB", "mongodb": "MongoDB", "sqlite": "SQLite",
              "supabase": "Supabase", "neon": "Neon"}
+# DB family (engine) aliases only — excludes managed providers (Neon/Supabase) so the
+# consistency check compares engines, not vendors. postgres == postgresql == PostgreSQL.
+_DB_FAMILY_RE = re.compile(r"\b(postgres|postgresql|mysql|mariadb|mongodb|sqlite)\b", re.IGNORECASE)
+_DB_FAMILY_CANON = {"postgres": "PostgreSQL", "postgresql": "PostgreSQL", "mysql": "MySQL",
+                    "mariadb": "MariaDB", "mongodb": "MongoDB", "sqlite": "SQLite"}
 _PAY_CANON = {"midtrans": "Midtrans", "stripe": "Stripe", "xendit": "Xendit", "paypal": "PayPal"}
 _INFRA_CANON = {"vercel": "Vercel", "heroku": "Heroku", "railway": "Railway", "render": "Render",
                 "ecs": "AWS ECS", "aws": "AWS", "gcp": "GCP", "google cloud": "GCP",
@@ -532,6 +537,31 @@ def canonical_project_decisions(project: dict) -> str:
     return render_canonical_spec(build_canonical_spec(project))
 
 
+# ---------- Discovery state (D0.1) ----------
+# Structured requirement discovery sits ON TOP of the existing PRD engine. This layer
+# only owns the state machine + generation guard; the AI analyzer/completeness engine
+# land in D0.2+. Legacy projects (no discovery_status field) are treated as "confirmed".
+DISCOVERY_STATUSES = ("none", "in_progress", "awaiting_confirmation", "confirmed")
+_DISCOVERY_TRANSITIONS = {
+    "none": {"in_progress"},
+    "in_progress": {"awaiting_confirmation", "none"},
+    "awaiting_confirmation": {"confirmed", "in_progress"},
+    "confirmed": set(),
+}
+
+
+def transition_discovery_status(current: str, new: str) -> str:
+    if new not in DISCOVERY_STATUSES:
+        raise ValueError(f"Unknown discovery status: {new}")
+    if new not in _DISCOVERY_TRANSITIONS.get(current, set()):
+        raise ValueError(f"Invalid discovery transition: {current} -> {new}")
+    return new
+
+
+def discovery_confirmed(project: dict) -> bool:
+    return project.get("discovery_status", "confirmed") == "confirmed"
+
+
 @api_router.post("/projects")
 async def create_project(body: ProjectCreate, user: dict = Depends(get_current_user)):
     plan = PLANS.get(user.get("plan", "free"), PLANS["free"])
@@ -545,6 +575,8 @@ async def create_project(body: ProjectCreate, user: dict = Depends(get_current_u
         "user_id": user["user_id"],
         "prd_status": "none",
         "prompt_status": "none",
+        "discovery_status": "none",
+        "discovery": {"idea": doc.get("description", ""), "questions": [], "answers": {}, "summary": "", "confirmed_at": None},
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -777,8 +809,13 @@ def analyze_prd_consistency(content: str) -> dict:
     api_l = api.lower()
 
     # 1. DB family vs deployment contradiction (PostgreSQL vs MySQL).
-    db_family = next((f for f in ("postgresql", "postgres", "mysql", "mariadb", "mongodb", "sqlite") if f in db_l), None)
-    deploy_family = next((f for f in ("postgresql", "postgres", "mysql", "mariadb", "mongodb", "sqlite") if f in tech.lower() and f != db_family), None)
+    # Normalize postgres/postgresql aliases BEFORE comparison; no raw substring match.
+    def _db_family(text: str) -> Optional[str]:
+        toks = _collect(_DB_FAMILY_RE, text)
+        return _DB_FAMILY_CANON.get(toks[0], toks[0]) if toks else None
+    db_family = _db_family(db)
+    deploy_family = next((_DB_FAMILY_CANON.get(t, t) for t in _collect(_DB_FAMILY_RE, tech)
+                          if _DB_FAMILY_CANON.get(t, t) != db_family), None)
     if db_family and deploy_family:
         critical.append(f"Database uses {db_family} but architecture/deployment references {deploy_family}")
 
@@ -819,8 +856,10 @@ def analyze_prd_consistency(content: str) -> dict:
     if status_conflicts:
         medium.append("Possible duplicate status vocabulary: " + ", ".join(status_conflicts))
 
-    # 6. "real-time" claimed without a mechanism.
-    if re.search(r"\breal[- ]time\b", lowered) and not re.search(r"\b(websocket|sse|server[- ]sent|polling|_{interval)\b", lowered):
+    # 6. "real-time" claimed without a mechanism — ignore mentions that live only in Non-Goals.
+    non_goals_body = section_body("## 2. Problem, Goals, and Non-Goals").lower()
+    rest = lowered.replace(non_goals_body, "")
+    if re.search(r"\breal[- ]time\b", rest) and not re.search(r"\b(websocket|sse|server[- ]sent|polling)\b", lowered):
         medium.append("'real-time' is claimed without defining a transport mechanism")
 
     # 7. Notification mentioned without provider/out-of-scope marker.
@@ -1016,10 +1055,9 @@ CANONICAL_GLOBAL_RULES = """PROJECT FOLLOWING RULES:
   - Do NOT keep two unrelated auth systems (NextAuth session cookie + a separate custom JWT + a third login token) without a single explained source of truth. Never mix "session cookie" and "Bearer JWT" as parallel, unexplained mechanisms.
   - State clearly which mechanism protects the API chosen for the product, and name the auth env vars (e.g. AUTH_SECRET / NEXT_PUBLIC_AUTH_URL) once, consistently.
 - Pick ONE infrastructure/hosting stack and apply it consistently across tech stack, architecture, environment variables, local development, deployment, database, media storage, external services, and setup instructions:
-  - Use the project's existing decisions. For example: web = Vercel; database = Neon PostgreSQL; image storage = Cloudinary; payment = Midtrans.
-  - Never offer two alternatives for the same concern. Do NOT write "Supabase / Neon", "Vercel / Heroku", "Railway / Render", "S3 / Cloudinary" unless one is genuinely the fallback for the other and you state a selection criterion.
   - For each external service (database, storage, hosting, payments, AI, email), state ONE provider, ONE purpose, and ONE environment-variable set.
   - Keep local development in sync: the same database/storage choices used in deployment must appear in setup instructions.
+  - If the user did NOT specify a provider for a concern (hosting, database vendor, storage, deployment), do NOT select a concrete provider. Mark it "Undetermined" (belum ditentukan) or state an explicitly labeled assumption; never fill in a provider just because it is a common default.
 - Pick ONE canonical value for every important business constant and apply it identically in every section (overview, goals, constraints, journey, FRs, UX, database, API, security, integration, architecture, validation, testing, delivery, decisions, env vars). Pick based on the user's actual requirement; do not invent or estimate a value. Never write a number one way in one section and differently elsewhere (e.g. radius 50m in overview but 100m in database) — that is a contradiction.
 - Pick ONE canonical terminology/vocabulary and use it everywhere. Do not mix synonyms for the same concept: use exactly one of {employee, karyawan, staff, user} for the same role, one of {admin, superadmin} for a role, one of {PRESENT, MASUK} for a concept, and one route name per page. Do not create multiple routes for the same page.
 - Pick ONE password hashing algorithm (either Argon2id or bcrypt) and use it consistently in database, auth, security, architecture, tech stack, assumptions, delivery, setup, and testing. Never write "Argon2id / bcrypt".
@@ -1603,8 +1641,10 @@ async def generate_prd_chunk(provider: str, api_key: str, base_url: str, model: 
             if headings and headings != expected:
                 problem = ", ".join(headings)
             else:
-                if headings == expected:
-                    chunk = re.sub(r"^##\s+\d+\.\s+.*(?:\r?\n|$)", "", chunk, count=1, flags=re.MULTILINE).strip()
+                # Orchestrator owns the heading: strip any model-emitted copy of THIS
+                # section's heading (at ANY # level, e.g. a duplicate `### 7.`) so the
+                # final document has exactly one canonical `## N.` heading per section.
+                chunk = re.sub(rf"^#{{1,6}}\s+{start + 1}\.\s+.*(?:\r?\n|$)", "", chunk, flags=re.MULTILINE).strip()
                 if chunk:
                     return f"{expected[0]}\n\n{chunk}"
                 problem = "empty section body"
@@ -1993,6 +2033,8 @@ async def generate_prd(project_id: str, body: GenerateRequest, user: dict = Depe
     project = await db.projects.find_one({"id": project_id, "user_id": user["user_id"]}, {"_id": 0})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if not discovery_confirmed(project):
+        raise HTTPException(status_code=400, detail=f"Discovery belum selesai (status: {project.get('discovery_status')}). Selesaikan dan konfirmasi discovery terlebih dahulu.")
     try:
         spec = build_and_validate_project_spec(project)
     except ValueError as error:
@@ -2010,6 +2052,8 @@ async def generate_agent_prompt(project_id: str, body: GenerateRequest, user: di
     prd = await db.prd_documents.find_one({"project_id": project_id}, {"_id": 0}, sort=[("version", -1)])
     if not prd:
         raise HTTPException(status_code=400, detail="Generate the PRD first")
+    if not discovery_confirmed(project):
+        raise HTTPException(status_code=400, detail=f"Discovery belum selesai (status: {project.get('discovery_status')}). Selesaikan dan konfirmasi discovery terlebih dahulu.")
     try:
         spec = build_and_validate_project_spec(project)
     except ValueError as error:
