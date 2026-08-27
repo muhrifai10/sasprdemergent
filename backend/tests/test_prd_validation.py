@@ -1488,3 +1488,85 @@ def test_phase5_fallback_output_can_enter_repair(monkeypatch):
     calls, repair, validate, _ = _run_generation_job(monkeypatch, canon, attempts, fail_first=True, bad_fallback=True)
     assert repair, "fallback output with conflicts must reach the repair loop"
     assert repair[-1] == "deepseek"
+
+
+# ---------- Phase 6: security consistency + semantic numeric validator ----------
+
+def test_phase6_hashing_canonical_argon2id_consistent():
+    p = {"name": "X", "auth_requirement": "Login email (Argon2id)"}
+    spec = server.build_canonical_spec(p)
+    assert spec.password_hashing == "Argon2id"
+    content = _prd({7: "Password hashed with Argon2id."})
+    assert not any(v.kind == "hashing" for v in server.canonical_violations(content, spec))
+
+
+def test_phase6_hashing_canonical_bcrypt_consistent():
+    p = {"name": "X", "auth_requirement": "Login (bcrypt)"}
+    spec = server.build_canonical_spec(p)
+    assert spec.password_hashing == "bcrypt"
+    content = _prd({7: "Password hashed with bcrypt."})
+    assert not any(v.kind == "hashing" for v in server.canonical_violations(content, spec))
+
+
+def test_phase6_hashing_conflict_detected():
+    p = {"name": "X", "auth_requirement": "Login (Argon2id)"}
+    spec = server.build_canonical_spec(p)
+    content = _prd({7: "Password hashed with bcrypt."})
+    vs = server.canonical_violations(content, spec)
+    assert any(v.kind == "hashing" and v.actual == "bcrypt" for v in vs)
+
+
+def test_phase6_hashing_conflict_repaired(monkeypatch):
+    p = {"name": "X", "auth_requirement": "Login (Argon2id)"}
+    content = _prd({7: "Password hashed with bcrypt."})
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 8. Authentication, Authorization, and Security\n\nPassword hashed with Argon2id.\n"))
+    out, diag = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    assert "Argon2id" in out and "bcrypt" not in out
+    assert not any(v["kind"] == "hashing" for v in diag["unresolved"])
+
+
+def test_phase6_hashing_canonical_unchanged(monkeypatch):
+    p = {"name": "X", "auth_requirement": "Login (Argon2id)"}
+    before = server.build_canonical_spec(p).model_dump()
+    content = _prd({7: "Password hashed with bcrypt."})
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 8. Authentication, Authorization, and Security\n\nPassword hashed with Argon2id.\n"))
+    asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    assert server.build_canonical_spec(p).model_dump() == before
+
+
+def test_phase6_hashing_conflict_rejected_at_gate():
+    p = {"name": "X", "auth_requirement": "Login (Argon2id or bcrypt)"}
+    issues = server.validate_project_spec(p)
+    assert any("Password hashing inconsistent" in i for i in issues)
+
+
+def test_phase6_numeric_timeout_vs_retry_not_conflict():
+    content = _prd({3: "Timeout 120 detik. Retry 3 kali."})
+    r = server.analyze_prd_consistency(content)
+    assert not any("Numeric business value inconsistent" in m for m in r["medium"])
+
+
+def test_phase6_numeric_same_context_conflict():
+    content = _prd({3: "Timeout 120 detik. Timeout 180 detik."})
+    r = server.analyze_prd_consistency(content)
+    assert any("Numeric business value inconsistent" in m for m in r["medium"])
+
+
+def test_phase6_numeric_retry_conflict():
+    content = _prd({3: "Retry 3 kali. Retry 5 kali."})
+    r = server.analyze_prd_consistency(content)
+    assert any("Numeric business value inconsistent" in m for m in r["medium"])
+
+
+def test_phase6_numeric_same_value_consistent():
+    content = _prd({3: "Timeout 120 detik.", 5: "Timeout 120 detik."})
+    r = server.analyze_prd_consistency(content)
+    assert not any("Numeric business value inconsistent" in m for m in r["medium"])
+
+
+def test_phase6_numeric_different_units_not_compared():
+    content = _prd({3: "Timeout 120 detik. Retensi 180 hari."})
+    r = server.analyze_prd_consistency(content)
+    assert not any("Numeric business value inconsistent" in m for m in r["medium"])

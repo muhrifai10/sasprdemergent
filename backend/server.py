@@ -382,6 +382,7 @@ class CanonicalProductSpec(BaseModel):
     infrastructure: str = ""           # normalized canonical
     payments: str = ""                 # normalized canonical
     storage: str = ""                  # normalized canonical
+    password_hashing: str = ""         # normalized canonical ("" if unspecified)
     integrations: str = ""
     notifications: str = ""
     constraints: str = ""
@@ -410,6 +411,7 @@ _PAY_RE = re.compile(r"\b(midtrans|stripe|xendit|paypal)\b", re.IGNORECASE)
 _INFRA_RE = re.compile(r"\b(vercel|heroku|railway|render|ecs|aws|gcp|google cloud|fly\.io|netlify|digitalocean)\b", re.IGNORECASE)
 _STOR_RE = re.compile(r"\b(s3|cloudinary|amazon s3|aws s3|supabase storage|firebase storage)\b", re.IGNORECASE)
 _TECH_RE = re.compile(r"\b(laravel|next\.?js|react|node|django|fastapi|flask|spring boot|express|nuxt)\b", re.IGNORECASE)
+_HASH_RE = re.compile(r"\b(argon2id|argon2|bcrypt|bycrypt|pbkdf2|scrypt)\b", re.IGNORECASE)
 
 _DB_CANON = {"postgres": "PostgreSQL", "postgresql": "PostgreSQL", "mysql": "MySQL",
              "mariadb": "MariaDB", "mongodb": "MongoDB", "sqlite": "SQLite",
@@ -421,6 +423,8 @@ _INFRA_CANON = {"vercel": "Vercel", "heroku": "Heroku", "railway": "Railway", "r
 _STOR_CANON = {"s3": "AWS S3", "amazon s3": "AWS S3", "aws s3": "AWS S3",
                "cloudinary": "Cloudinary", "supabase storage": "Supabase Storage",
                "firebase storage": "Firebase Storage"}
+_HASH_CANON = {"argon2id": "Argon2id", "argon2": "Argon2id", "bcrypt": "bcrypt",
+               "bycrypt": "bcrypt", "pbkdf2": "PBKDF2", "scrypt": "scrypt"}
 
 
 def _collect(pattern: re.Pattern, text: str) -> list[str]:
@@ -455,6 +459,7 @@ def build_canonical_spec(project: dict) -> CanonicalProductSpec:
         infrastructure=_canonical(_INFRA_RE, (deploy + " " + tech), _INFRA_CANON),
         payments=_canonical(_PAY_RE, pay_raw, _PAY_CANON),
         storage=_canonical(_STOR_RE, integ, _STOR_CANON),
+        password_hashing=_canonical(_HASH_RE, (auth + " " + tech + " " + (get("additional_requirements") or "")), _HASH_CANON),
         integrations=integ,
         constraints=get("additional_requirements") or "",
         explicit_decisions=explicit,
@@ -498,6 +503,9 @@ def validate_canonical_spec(spec: CanonicalProductSpec) -> list[str]:
     tech = _collect(_TECH_RE, spec.technology)
     if len(tech) > 1:
         issues.append(f"Technology/framework inconsistent: {'/'.join(tech)}; pick one")
+    hashes = _collect(_HASH_RE, spec.password_hashing)
+    if len(hashes) > 1:
+        issues.append(f"Password hashing inconsistent: {'/'.join(hashes)}; pick one")
     return issues
 
 
@@ -893,21 +901,31 @@ def analyze_prd_consistency(content: str) -> dict:
     if tech_family and deploy_family and tech_family != deploy_family and not re.search(r"selection criteria|fallback|^or$|alternate", deploy_section, re.IGNORECASE):
         high.append(f"Database provider differs between tech stack ({tech_family}) and deployment section ({deploy_family}); pick one")
 
-    # 15. Canonical numeric values: same named business constant with two different numbers.
+    # 15. Canonical numeric values: flag only when the SAME semantic context (label + unit)
+    # carries two different magnitudes. A bare unit alone is NOT enough to call a conflict:
+    # "timeout 120 detik" vs "retry 3 kali" are different contexts and must not collide.
+    # ponytail: nearest-label heuristic; a full parser only if this still false-positives.
     numbers = {}
-    for name in re.findall(r"\b([A-Z][A-Z0-9_]{2,}(?:_RADIUS|_METERS|_METER|_LIMIT|_MAX|_DAYS|_HOURS|_KM|_COUNT))\b", lowered):
-        if name.lower() not in numbers:
-            numbers[name.lower()] = set()
-    # Collect "<value> <unit>" statements tied to a context keyword (radius/limit/duration).
-    for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*(meter|meters?|m\b|km|kilometer|kilometers|menit|minutes?|hari|days?|jam|hours?|detik|seconds?|orang|pax|unit)\b", lowered):
+    num_re = re.compile(
+        r"\b(\d+(?:\.\d+)?)\s*"
+        r"(meter|meters?|m\b|km|kilometer|kilometers|menit|minutes?|hari|days?|jam|hours?|"
+        r"detik|seconds?|orang|pax|unit|kali|times|attempts?|retries?)\b"
+    )
+    for match in num_re.finditer(lowered):
         unit = match.group(2).lower()
         val = match.group(1)
-        # Heuristic: same unit appearing with two different magnitudes.
-        if unit not in numbers:
-            numbers[unit] = set()
-        numbers[unit].add(val)
+        before = lowered[max(0, match.start() - 30):match.start()]
+        bw = re.findall(r"\b[a-z][a-z0-9_]*\b", before)
+        if bw:
+            ctx = bw[-1]
+        else:
+            after = lowered[match.end():match.end() + 30]
+            aw = re.findall(r"\b[a-z][a-z0-9_]*\b", after)
+            ctx = next((w for w in aw if w != unit), "")
+        key = f"{ctx} {unit}".strip()
+        numbers.setdefault(key, set()).add(val)
     for key, vals in numbers.items():
-        if len(vals) > 1:
+        if key and len(vals) > 1:
             medium.append(f"Numeric business value inconsistent for '{key}': {'/'.join(sorted(vals))}; pick one canonical value")
 
     # 16. Duplicate config source: business config in DB AND env var with no clear single source of truth.
@@ -1091,7 +1109,6 @@ RULES:
 - In Section 14, record every assumption and decision, including the resolution of any unspecified choice, and state whether any unresolved items remain.
 - Never repeat one of the 14 required section headings as a `###` or another heading; use each required `##` heading exactly once. Other numbered subheadings are allowed.
 - In Section 12, include concrete Given/When/Then acceptance tests for the product's critical flows: authentication/authorization, the primary user journey, any async/generation flow, exports, restore, delete, rate limiting, and secret handling. Label them AC-AUTH, AC-AUTHZ, AC-GENERATION (if the product generates content), AC-USAGE, AC-EXPORT, AC-RESTORE, AC-DELETE, AC-RATE-LIMIT, and AC-SECRET as applicable.
-- Do not print internal validation labels such as DELETE_TEMPLATE_EFFECT, USAGE_LOG_CARDINALITY, or USAGELOG_NULLABLE_FIELDS in the final PRD. State their meanings naturally.
 - Mark genuinely unclear product items with "⚠ Needs Clarification" plus the assumption used.
 - Keep each section focused and concrete. This document must be directly usable by an AI coding agent without guessing."""
 
@@ -1323,6 +1340,17 @@ def canonical_violations(content: str, spec: CanonicalProductSpec) -> list[Confl
                 actual="AI generation declared out of scope",
                 rule="Non-Goals excludes a feature the user explicitly requested",
                 evidence="Non-Goals contradicts scope"))
+        if spec.password_hashing:
+            canon_low = spec.password_hashing.lower()
+            for name, canon in _HASH_CANON.items():
+                if name.lower() in canon_low:
+                    continue
+                if re.search(rf"\b{re.escape(name)}\b", low):
+                    issues.append(Conflict(
+                        kind="hashing", severity="critical", section=idx, expected=spec.password_hashing, actual=canon,
+                        rule="Section uses a password hashing algorithm different from the canonical decision",
+                        evidence="password hashing mismatch"))
+                    break
     return issues
 
 
