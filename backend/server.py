@@ -1909,8 +1909,11 @@ class SPAStaticFiles(StaticFiles):
         return response
 
 
-FRONTEND_DIST = ROOT_DIR / "frontend_dist"
-if FRONTEND_DIST.exists():
+FRONTEND_DIST = next(
+    (p for p in (ROOT_DIR / "frontend_dist", ROOT_DIR.parent / "frontend" / "build") if p.exists()),
+    None,
+)
+if FRONTEND_DIST:
     app.mount("/", SPAStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
 
 
