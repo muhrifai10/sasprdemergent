@@ -357,42 +357,171 @@ def project_context(p: dict) -> str:
     return "\n".join(f"- {k}: {v}" for k, v in fields if v)
 
 
-def canonical_project_decisions(p: dict) -> str:
-    """Deterministic per-project frozen spec, derived only from the user's
-    explicit inputs. Every section must read and reuse these exact values so a
-    new project never drifts or inherits decisions from a previous one.
+# ---------- CanonicalProductSpec (structured source of truth) ----------
+# Phase 2: single structured object, derived deterministically from the user's
+# explicit project inputs. No LLM, no silent invention. The prompt's frozen text
+# is a *projection* of this object; generators and the validator read it directly.
+# ponytail: plain dict + Pydantic, no registry/factory. Add fields only when a
+# new decision category actually needs to be frozen.
 
-    ponytail: extraction is deterministic (no LLM) so it adds no latency and
-    can never invent a decision — only fields the user actually filled appear.
-    """
-    lines: list[str] = []
-    tech = p.get("preferred_technology")
-    auth = p.get("auth_requirement")
-    pay = p.get("payment_requirement")
-    integ = p.get("integrations")
-    deploy = p.get("deployment_preference")
-    ttype = p.get("product_type")
-    users = p.get("target_users")
-    goal = p.get("business_goal")
-    if tech:
-        lines.append(f"- Technology (frozen): {tech}")
-    if auth:
-        lines.append(f"- Authentication (frozen): {auth}")
-    if pay:
-        lines.append(f"- Payment (frozen): {pay}")
-    if integ:
-        lines.append(f"- Integrations (frozen): {integ}")
-    if deploy:
-        lines.append(f"- Deployment (frozen): {deploy}")
-    if ttype:
-        lines.append(f"- Product type (frozen): {ttype}")
-    if users:
-        lines.append(f"- Target users (frozen): {users}")
-    if goal:
-        lines.append(f"- Business goal (frozen): {goal}")
+
+class CanonicalProductSpec(BaseModel):
+    product: str = ""
+    domain: str = "generic"            # "commerce" | "generic"
+    product_type: str = ""
+    target_users: str = ""
+    business_goal: str = ""
+    scope: str = ""
+    non_goals: str = ""
+    features: str = ""
+    roles: str = ""
+    permissions: str = ""
+    authentication: str = ""
+    technology: str = ""               # raw user tech
+    database: str = ""                 # normalized canonical ("" if absent)
+    infrastructure: str = ""           # normalized canonical
+    payments: str = ""                 # normalized canonical
+    storage: str = ""                  # normalized canonical
+    integrations: str = ""
+    notifications: str = ""
+    constraints: str = ""
+    explicit_decisions: dict[str, str] = Field(default_factory=dict)
+    assumptions: list[str] = Field(default_factory=list)
+    unknown: list[str] = Field(default_factory=list)
+
+
+_EXPLICIT_LABELS = (
+    "Technology", "Authentication", "Payment", "Integrations", "Deployment",
+    "Product type", "Target users", "Business goal",
+)
+_EXPLICIT_SOURCE = {
+    "Technology": "preferred_technology",
+    "Authentication": "auth_requirement",
+    "Payment": "payment_requirement",
+    "Integrations": "integrations",
+    "Deployment": "deployment_preference",
+    "Product type": "product_type",
+    "Target users": "target_users",
+    "Business goal": "business_goal",
+}
+
+_DB_RE = re.compile(r"\b(postgres|postgresql|mysql|mariadb|mongodb|sqlite|supabase|neon)\b", re.IGNORECASE)
+_PAY_RE = re.compile(r"\b(midtrans|stripe|xendit|paypal)\b", re.IGNORECASE)
+_INFRA_RE = re.compile(r"\b(vercel|heroku|railway|render|ecs|aws|gcp|google cloud|fly\.io|netlify|digitalocean)\b", re.IGNORECASE)
+_STOR_RE = re.compile(r"\b(s3|cloudinary|amazon s3|aws s3|supabase storage|firebase storage)\b", re.IGNORECASE)
+_TECH_RE = re.compile(r"\b(laravel|next\.?js|react|node|django|fastapi|flask|spring boot|express|nuxt)\b", re.IGNORECASE)
+
+_DB_CANON = {"postgres": "PostgreSQL", "postgresql": "PostgreSQL", "mysql": "MySQL",
+             "mariadb": "MariaDB", "mongodb": "MongoDB", "sqlite": "SQLite",
+             "supabase": "Supabase", "neon": "Neon"}
+_PAY_CANON = {"midtrans": "Midtrans", "stripe": "Stripe", "xendit": "Xendit", "paypal": "PayPal"}
+_INFRA_CANON = {"vercel": "Vercel", "heroku": "Heroku", "railway": "Railway", "render": "Render",
+                "ecs": "AWS ECS", "aws": "AWS", "gcp": "GCP", "google cloud": "GCP",
+                "fly.io": "Fly.io", "netlify": "Netlify", "digitalocean": "DigitalOcean"}
+_STOR_CANON = {"s3": "AWS S3", "amazon s3": "AWS S3", "aws s3": "AWS S3",
+               "cloudinary": "Cloudinary", "supabase storage": "Supabase Storage",
+               "firebase storage": "Firebase Storage"}
+
+
+def _collect(pattern: re.Pattern, text: str) -> list[str]:
+    return list(dict.fromkeys(m.lower() for m in pattern.findall(text or "")))
+
+
+def _canonical(pattern: re.Pattern, text: str, mapping: dict) -> str:
+    return ", ".join(dict.fromkeys(mapping.get(m.lower(), m) for m in _collect(pattern, text)))
+
+
+def build_canonical_spec(project: dict) -> CanonicalProductSpec:
+    get = project.get
+    tech = get("preferred_technology") or ""
+    auth = get("auth_requirement") or ""
+    pay_raw = get("payment_requirement") or ""
+    integ = get("integrations") or ""
+    deploy = get("deployment_preference") or ""
+    explicit = {label: (get(_EXPLICIT_SOURCE[label]) or "") for label in _EXPLICIT_LABELS}
+    explicit = {label: value for label, value in explicit.items() if value}
+
+    return CanonicalProductSpec(
+        product=get("name") or "",
+        domain=infer_domain(project),
+        product_type=get("product_type") or "",
+        target_users=get("target_users") or "",
+        business_goal=get("business_goal") or "",
+        scope=get("main_problem") or "",
+        features=get("desired_features") or "",
+        authentication=auth,
+        technology=tech,
+        database=_canonical(_DB_RE, tech, _DB_CANON),
+        infrastructure=_canonical(_INFRA_RE, (deploy + " " + tech), _INFRA_CANON),
+        payments=_canonical(_PAY_RE, pay_raw, _PAY_CANON),
+        storage=_canonical(_STOR_RE, integ, _STOR_CANON),
+        integrations=integ,
+        constraints=get("additional_requirements") or "",
+        explicit_decisions=explicit,
+    )
+
+
+def render_canonical_spec(spec: CanonicalProductSpec) -> str:
+    """Deterministic text projection of the structured spec (presentation layer).
+    The structured object remains the authoritative source; this is only context."""
+    lines = []
+    for label in _EXPLICIT_LABELS:
+        if label in spec.explicit_decisions:
+            lines.append(f"- {label} (frozen): {spec.explicit_decisions[label]}")
     if not lines:
         lines.append("- Canonical spec: none explicitly stated; derive from description with safe defaults, do NOT invent.")
+    lines.append(f"- Domain (detected): {spec.domain}")
     return "\n".join(lines)
+
+
+def validate_canonical_spec(spec: CanonicalProductSpec) -> list[str]:
+    """Deterministic pre-generation conflict detection over the structured spec.
+    Only flags real contradictions; never invents a decision. ponytail: a handful
+    of canonical-token checks — extend the pattern sets, not the framework, if a
+    new provider family appears."""
+    issues: list[str] = []
+    if spec.domain not in {"commerce", "generic"}:
+        issues.append(f"Unknown domain: {spec.domain}")
+
+    pay = _collect(_PAY_RE, spec.payments)
+    if len(pay) > 1:
+        issues.append(f"Payment provider inconsistent: {'/'.join(pay)}; pick one")
+    infra = _collect(_INFRA_RE, spec.infrastructure)
+    if len(infra) > 1:
+        issues.append(f"Infrastructure inconsistent: {'/'.join(infra)}; pick one")
+    db = _collect(_DB_RE, spec.database)
+    if len(db) > 1:
+        issues.append(f"Database inconsistent: {'/'.join(db)}; pick one")
+    stor = _collect(_STOR_RE, spec.storage)
+    if len(stor) > 1:
+        issues.append(f"Storage inconsistent: {'/'.join(stor)}; pick one")
+    tech = _collect(_TECH_RE, spec.technology)
+    if len(tech) > 1:
+        issues.append(f"Technology/framework inconsistent: {'/'.join(tech)}; pick one")
+    return issues
+
+
+def validate_project_spec(project: dict) -> list[str]:
+    return validate_canonical_spec(build_canonical_spec(project))
+
+
+def build_and_validate_project_spec(project: dict) -> CanonicalProductSpec:
+    """Pre-generation gate: build the canonical spec and reject conflicts that are
+    deterministically known. Raises ValueError so the API layer can return a 422 —
+    no generation job is created, and the AI provider is never called."""
+    spec = build_canonical_spec(project)
+    issues = validate_canonical_spec(spec)
+    if issues:
+        raise ValueError("Canonical spec invalid: " + "; ".join(issues))
+    return spec
+
+
+def canonical_project_decisions(project: dict) -> str:
+    """Frozen canonical context for the prompt. This text is a *projection* of the
+    structured CanonicalProductSpec (see render_canonical_spec); the spec object
+    is the authoritative source used by generation, validation, and future repair.
+    """
+    return render_canonical_spec(build_canonical_spec(project))
 
 
 @api_router.post("/projects")
@@ -856,13 +985,31 @@ The agent must stop after each phase and write a short completion report before 
 Output only the copy-paste-ready prompt."""
 
 
-CANONICAL_MVP_DECISIONS = """PROJECT FOLLOWING RULES:
+CANONICAL_GLOBAL_RULES = """PROJECT FOLLOWING RULES:
 - The PRD describes the USER'S product as stated in PROJECT REQUIREMENTS. Do not describe this PRD-writing tool, the generator, or any meta-layer; the document is purely about the user's business.
 - Honor every technology, framework, language, database, payment gateway, authentication method, role, and integration that the user explicitly named. If the user said Laravel, MySQL, and Midtrans, use exactly those. Never substitute a different stack.
 - If the user left a required choice unspecified (for example no database, auth, or payment gateway named), choose ONE reasonable default, use it consistently everywhere, and record the decision and reason in Section 14. Never mix alternatives such as Stripe and Midtrans, PostgreSQL and MongoDB, or Next.js and React CRA.
 - Define the MVP boundary around only what the user asked for. Put optional or future ideas under Non-Goals or Future Enhancements, not inside mandatory requirements.
 - Only invent features, roles, entities, or integrations when the user's requirements genuinely imply them; otherwise state them as out of scope.
 - Keep a traceable chain: every functional requirement must map to a page/state, data entity, API or service behavior, acceptance test, and delivery phase. Do not reference tables, endpoints, roles, or services that are not defined elsewhere.
+- Use ONE coherent authentication architecture, consistently across every section (login page, login API, session middleware, API security, frontend session, admin/customer authorization, environment variables, testing). Pick ONCE and describe the full path:
+  - SESSION/COOKIE model: Authentication Provider = [user's choice, e.g. NextAuth/Laravel] Credentials; Session Strategy = JWT; Browser Auth = secure httpOnly session cookie; API Authorization = server verifies the session cookie/JWT on every request. The browser NEVER sends a raw Authorization: Bearer header that duplicates the session; the cookie is the credential.
+  - If a Bearer token is genuinely required (e.g. third-party API, mobile app), define it explicitly and link it to the same identity: token issuer = same auth server; format = signed JWT; validation = verify signature + claims + expiry on the API; lifetime = e.g. 7 days with rotation; how the frontend obtains it = from the login response/session claim; how the API validates = same secret/keys as session.
+  - Do NOT keep two unrelated auth systems (NextAuth session cookie + a separate custom JWT + a third login token) without a single explained source of truth. Never mix "session cookie" and "Bearer JWT" as parallel, unexplained mechanisms.
+  - State clearly which mechanism protects the API chosen for the product, and name the auth env vars (e.g. AUTH_SECRET / NEXT_PUBLIC_AUTH_URL) once, consistently.
+- Pick ONE infrastructure/hosting stack and apply it consistently across tech stack, architecture, environment variables, local development, deployment, database, media storage, external services, and setup instructions:
+  - Use the project's existing decisions. For example: web = Vercel; database = Neon PostgreSQL; image storage = Cloudinary; payment = Midtrans.
+  - Never offer two alternatives for the same concern. Do NOT write "Supabase / Neon", "Vercel / Heroku", "Railway / Render", "S3 / Cloudinary" unless one is genuinely the fallback for the other and you state a selection criterion.
+  - For each external service (database, storage, hosting, payments, AI, email), state ONE provider, ONE purpose, and ONE environment-variable set.
+  - Keep local development in sync: the same database/storage choices used in deployment must appear in setup instructions.
+- Pick ONE canonical value for every important business constant and apply it identically in every section (overview, goals, constraints, journey, FRs, UX, database, API, security, integration, architecture, validation, testing, delivery, decisions, env vars). Pick based on the user's actual requirement; do not invent or estimate a value. Never write a number one way in one section and differently elsewhere (e.g. radius 50m in overview but 100m in database) — that is a contradiction.
+- Pick ONE canonical terminology/vocabulary and use it everywhere. Do not mix synonyms for the same concept: use exactly one of {employee, karyawan, staff, user} for the same role, one of {admin, superadmin} for a role, one of {PRESENT, MASUK} for a concept, and one route name per page. Do not create multiple routes for the same page.
+- Pick ONE password hashing algorithm (either Argon2id or bcrypt) and use it consistently in database, auth, security, architecture, tech stack, assumptions, delivery, setup, and testing. Never write "Argon2id / bcrypt".
+- Pick ONE source of truth for business configuration. If a value is admin-editable or manager-controllable (e.g. office latitude/longitude, attendance radius, active status), it MUST come from the database; environment variables are only for secrets, API keys, and immutable infrastructure config. Never define a business value in both a database field and an env var as alternative sources.
+- Define ONE canonical route per page (e.g. dashboard) and use that exact route in journey, UX, API, middleware, architecture, testing, and delivery. Do not introduce alias routes.
+- Define Google OAuth account linking explicitly. If an existing password account shares the same email as a Google login, state LINK TO EXISTING ACCOUNT or REJECT LINKING; never create duplicate accounts silently."""
+
+CANONICAL_COMMERCE_RULES = """COMMERCE (order / inventory / shipping) RULES — apply ONLY when the project involves products, orders, inventory, or shipping:
 - Pick ONE checkout access model and apply it consistently across every section (users/roles, journey, FRs, pages, database, API, auth, security, testing):
   - MODEL A (authenticated checkout): catalog is public; cart, checkout, create-order, and order details all require a logged-in customer; orders.user_id is REQUIRED; POST /api/orders requires authentication. Do NOT mark checkout or order pages as public.
   - MODEL B (guest checkout): catalog, cart, checkout, and create-order are public; orders.user_id is NULLABLE; public order access uses a secure random order token like /orders/{order_token}, never a guessable DB id.
@@ -888,23 +1035,33 @@ CANONICAL_MVP_DECISIONS = """PROJECT FOLLOWING RULES:
   - PENDING → EXPIRED (expiration path)
   - Meanings: PENDING = created, not yet paid; PAID = payment verified by gateway; PROCESSING = admin/toko processing; SHIPPED = sent; DELIVERED = received; CANCELLED = cancelled; EXPIRED = payment timed out.
   - Do NOT define extra order statuses (e.g. FAILED, COMPLETED, UNPAID, REFUNDED) as order states; payments may fail but order stays PENDING/CANCELLED/EXPIRED per the state machine.
-  - Separate ORDER status from PAYMENT status. Gateway values (deny, cancel, expire, failure, settlement, capture, pending) map to payment status, and only translate to order status via the rule: settlement/capture → PAID; no payment → EXPIRED when timed out; denied/expired before payment → EXPIRED; post-paid cancel/refund is out of MVP unless requested.
-- Use ONE coherent authentication architecture, consistently across every section (login page, login API, session middleware, API security, frontend session, admin/customer authorization, environment variables, testing). Pick ONCE and describe the full path:
-  - SESSION/COOKIE model: Authentication Provider = [user's choice, e.g. NextAuth/Laravel] Credentials; Session Strategy = JWT; Browser Auth = secure httpOnly session cookie; API Authorization = server verifies the session cookie/JWT on every request. The browser NEVER sends a raw Authorization: Bearer header that duplicates the session; the cookie is the credential.
-  - If a Bearer token is genuinely required (e.g. third-party API, mobile app), define it explicitly and link it to the same identity: token issuer = same auth server; format = signed JWT; validation = verify signature + claims + expiry on the API; lifetime = e.g. 7 days with rotation; how the frontend obtains it = from the login response/session claim; how the API validates = same secret/keys as session.
-  - Do NOT keep two unrelated auth systems (NextAuth session cookie + a separate custom JWT + a third login token) without a single explained source of truth. Never mix "session cookie" and "Bearer JWT" as parallel, unexplained mechanisms.
-  - State clearly which mechanism protects the API chosen for the product, and name the auth env vars (e.g. AUTH_SECRET / NEXT_PUBLIC_AUTH_URL) once, consistently.
-- Pick ONE infrastructure/hosting stack and apply it consistently across tech stack, architecture, environment variables, local development, deployment, database, media storage, external services, and setup instructions:
-  - Use the project's existing decisions. For example: web = Vercel; database = Neon PostgreSQL; image storage = Cloudinary; payment = Midtrans.
-  - Never offer two alternatives for the same concern. Do NOT write "Supabase / Neon", "Vercel / Heroku", "Railway / Render", "S3 / Cloudinary" unless one is genuinely the fallback for the other and you state a selection criterion.
-  - For each external service (database, storage, hosting, payments, AI, email), state ONE provider, ONE purpose, and ONE environment-variable set.
-  - Keep local development in sync: the same database/storage choices used in deployment must appear in setup instructions.
-- Pick ONE canonical value for every important business constant and apply it identically in every section (overview, goals, constraints, journey, FRs, UX, database, API, security, integration, architecture, validation, testing, delivery, decisions, env vars). Pick based on the user's actual requirement; do not invent or estimate a value. Never write a number one way in one section and differently elsewhere (e.g. radius 50m in overview but 100m in database) — that is a contradiction.
-- Pick ONE canonical terminology/vocabulary and use it everywhere. Do not mix synonyms for the same concept: use exactly one of {employee, karyawan, staff, user} for the same role, one of {admin, superadmin} for a role, one of {PRESENT, MASUK} for a concept, and one route name per page. Do not create multiple routes for the same page.
-- Pick ONE password hashing algorithm (either Argon2id or bcrypt) and use it consistently in database, auth, security, architecture, tech stack, assumptions, delivery, setup, and testing. Never write "Argon2id / bcrypt".
-- Pick ONE source of truth for business configuration. If a value is admin-editable or manager-controllable (e.g. office latitude/longitude, attendance radius, active status), it MUST come from the database; environment variables are only for secrets, API keys, and immutable infrastructure config. Never define a business value in both a database field and an env var as alternative sources.
-- Define ONE canonical route per page (e.g. dashboard) and use that exact route in journey, UX, API, middleware, architecture, testing, and delivery. Do not introduce alias routes.
-- Define Google OAuth account linking explicitly. If an existing password account shares the same email as a Google login, state LINK TO EXISTING ACCOUNT or REJECT LINKING; never create duplicate accounts silently."""
+  - Separate ORDER status from PAYMENT status. Gateway values (deny, cancel, expire, failure, settlement, capture, pending) map to payment status, and only translate to order status via the rule: settlement/capture → PAID; no payment → EXPIRED when timed out; denied/expired before payment → EXPIRED; post-paid cancel/refund is out of MVP unless requested."""
+
+# ponytail: deterministic keyword domain gate (no LLM, no latency). Upgrade to a
+# classifier only if false positives/negatives show up on real projects.
+_COMMERCE_SIGNALS = re.compile(
+    r"\b(e-commerce|ecommerce|e commerce|toko|store|retail|marketplace|produk|product|"
+    r"katalog|catalog|keranjang|cart|checkout|stock|stok|inventory|inventori|shipping|"
+    r"shipment|ongkir|pengiriman|variant|varian|sku|pesanan|jual|beli)\b",
+    re.IGNORECASE,
+)
+
+
+def infer_domain(project: dict) -> str:
+    text = " ".join(
+        str(project.get(k) or "") for k in (
+            "product_type", "description", "desired_features",
+            "additional_requirements", "integrations", "main_problem", "business_goal",
+        )
+    )
+    return "commerce" if _COMMERCE_SIGNALS.search(text) else "generic"
+
+
+def canonical_mvp_decisions(project: dict) -> str:
+    rules = [CANONICAL_GLOBAL_RULES]
+    if infer_domain(project) == "commerce":
+        rules.append(CANONICAL_COMMERCE_RULES)
+    return "\n\n".join(rules)
 
 
 def prd_user_prompt(project: dict, language: str) -> str:
@@ -914,7 +1071,7 @@ def prd_user_prompt(project: dict, language: str) -> str:
 PROJECT REQUIREMENTS:
 {project_context(project)}
 
-{CANONICAL_MVP_DECISIONS}
+{canonical_mvp_decisions(project)}
 
 RULES:
 - Start with: # Product Requirements Document — {project.get('name')}
@@ -1059,11 +1216,117 @@ async def stream_openai_compatible(provider: str, api_key: str, base_url: str, m
             yield response.choices[0].message.content
 
 
+# ---------- Dependency-aware section context ----------
+# Each chunk is generated against a *structured summary* of the earlier sections
+# it depends on, not the full raw text. This keeps later sections (data model,
+# API, security, testing) consistent with earlier ones (roles, FRs, entities)
+# without re-explaining the whole document or ballooning the prompt.
+# ponytail: deterministic regex extractors. Upgrade to a parser only if a real
+# extraction misses (e.g. non-markdown entity tables).
+
+_DEP_MAP = {
+    # section index -> earlier section indices it depends on
+    0: [], 1: [0], 2: [0, 1],          # overview / problem / users
+    3: [1, 2],                          # functional requirements
+    4: [2, 3],                          # UX pages
+    5: [2, 3, 4],                       # data model
+    6: [2, 3, 4, 5],                    # API spec
+    7: [2, 5, 6],                       # auth/security
+    8: [5, 6, 7],                       # integrations/payments
+    9: [6, 7],                          # tech stack/architecture
+    10: [4, 6],                         # validation/errors
+    11: [3, 4, 6, 7],                   # testing/AC
+    12: [6, 7],                         # delivery/environment
+    13: list(range(13)),                # assumptions/decisions read everything
+}
+
+_SECTION_HEADING_RE = re.compile(r"^##\s+(\d+)\.\s+.*$", re.MULTILINE)
+_FR_RE = re.compile(r"\b(FR-\d+)\b", re.IGNORECASE)
+_ROLE_RE = re.compile(r"\b(admin|customer|tenant|user|member|karyawan|staff|superadmin|owner|manager|guest|employee)\b", re.IGNORECASE)
+_ENTITY_RE = re.compile(r"\b([a-z][a-z0-9_]*(?:_id|s))\b")
+_API_RE = re.compile(r"\b(GET|POST|PUT|DELETE|PATCH)\s+(/\S+)", re.IGNORECASE)
+_INTEGRATION_NAMES = ("midtrans", "stripe", "xendit", "paypal", "firebase", "twilio",
+                      "cloudinary", "s3", "aws", "whatsapp", "email", "discord")
+_AUTH_TERMS = ("session cookie", "httponly", "jwt", "bearer", "oauth", "samesite",
+               "role-based", "rbac", "refresh token")
+
+
+def summarize_section(index: int, body: str) -> dict:
+    """Compact structured summary of one generated section (deterministic)."""
+    s: dict = {}
+    s["requirements"] = list(dict.fromkeys(x.upper() for x in _FR_RE.findall(body)))[:25]
+    s["roles"] = list(dict.fromkeys(x.lower() for x in _ROLE_RE.findall(body)))[:12]
+    s["apis"] = list(dict.fromkeys(f"{m[0].upper()} {m[1]}" for m in _API_RE.findall(body)))[:25]
+    s["entities"] = list(dict.fromkeys(x.lower() for x in _ENTITY_RE.findall(body)))[:15]
+    s["integrations"] = [x for x in _INTEGRATION_NAMES if x in body.lower()][:12]
+    s["auth"] = [x for x in _AUTH_TERMS if x in body.lower()][:8]
+    s["business_rules"] = [
+        m.group(0).strip() for m in re.finditer(
+            r"[^.\n]{20,200}\b(must|wajib|only|never|rule)\b[^.\n]{0,120}", body, re.IGNORECASE)][:6]
+    return s
+
+
+def parse_section_bodies(content: str) -> dict:
+    bodies: dict = {}
+    matches = list(_SECTION_HEADING_RE.finditer(content))
+    for i, m in enumerate(matches):
+        num = int(m.group(1))
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        bodies[num - 1] = content[m.end():end].strip()
+    return bodies
+
+
+def update_compiled(compiled: dict, chunk: str, start: int, end: int) -> None:
+    bodies = parse_section_bodies(chunk)
+    for sec in range(start, end):
+        if sec in bodies and bodies[sec]:
+            compiled[sec] = summarize_section(sec, bodies[sec])
+
+
+def build_dependency_context(compiled: dict, start: int, end: int) -> Optional[dict]:
+    srcs: set = set()
+    for s in range(start, end):
+        srcs.update(_DEP_MAP.get(s, []))
+    available = {i: compiled[i] for i in sorted(srcs) if i in compiled}
+    return available or None
+
+
+def render_dependency_context(deps: dict) -> str:
+    if not deps:
+        return ""
+    blocks = []
+    for idx in sorted(deps):
+        label = REQUIRED_PRD_HEADINGS[idx] if idx < len(REQUIRED_PRD_HEADINGS) else f"section {idx + 1}"
+        s = deps[idx]
+        lines = [f"- Source: {label}"]
+        if s.get("requirements"):
+            lines.append("- Requirements: " + ", ".join(s["requirements"]))
+        if s.get("entities"):
+            lines.append("- Entities: " + ", ".join(s["entities"]))
+        if s.get("roles"):
+            lines.append("- Roles: " + ", ".join(s["roles"]))
+        if s.get("apis"):
+            lines.append("- APIs: " + "; ".join(s["apis"]))
+        if s.get("integrations"):
+            lines.append("- Integrations: " + ", ".join(s["integrations"]))
+        if s.get("auth"):
+            lines.append("- Auth/security: " + ", ".join(s["auth"]))
+        if s.get("business_rules"):
+            lines.append("- Business rules: " + " | ".join(s["business_rules"]))
+        blocks.append("\n".join(lines))
+    return (
+        "STRUCTURED DEPENDENCY CONTEXT (decided in earlier sections — REUSE these exact "
+        "requirement/entity/role/endpoint identifiers; do NOT change them and do NOT invent "
+        "new ones without basis):\n" + "\n\n".join(blocks)
+    )
+
+
 def prd_chunk_user_prompt(project: dict, language: str, start: int, end: int) -> str:
     lang = "Bahasa Indonesia" if language == "id" else "English"
     sections = "\n".join(REQUIRED_PRD_HEADINGS[start:end])
     guidance = "\n".join(f"{heading}: {PRD_SECTION_GUIDANCE[heading]}" for heading in REQUIRED_PRD_HEADINGS[start:end])
     frozen = canonical_project_decisions(project)
+    dep = render_dependency_context(project.get("_dependency_context")) if project.get("_dependency_context") else ""
     if end - start == 1:
         word_limit = 600 if start in {5, 6} else 350 if start == 8 else 220
         return f"""Write concise Markdown in {lang} for this project.
@@ -1074,8 +1337,9 @@ Project requirements:
 FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT change them):
 {frozen}
 
-{CANONICAL_MVP_DECISIONS}
+{canonical_mvp_decisions(project)}
 
+{dep}
 Write only the body for this section:
 {sections}
 
@@ -1091,8 +1355,9 @@ Project requirements:
 FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT change them):
 {frozen}
 
-{CANONICAL_MVP_DECISIONS}
+{canonical_mvp_decisions(project)}
 
+{dep}
 Return only these sections, with each heading exactly once and in this order:
 {sections}
 
@@ -1155,13 +1420,22 @@ async def generate_prd_chunk(provider: str, api_key: str, base_url: str, model: 
 
 
 async def stream_prd(provider: str, api_key: str, base_url: str, model: str, project: dict, language: str, system_msg: str, user_msg: str):
+    # Dependency-aware: each chunk receives a structured summary of the earlier
+    # sections it depends on; the canonical spec stays the same for every chunk.
+    compiled: dict = {}
     if provider == "deepseek":
-        for start in range(len(REQUIRED_PRD_HEADINGS)):
-            yield await generate_prd_chunk(provider, api_key, base_url, model, project, language, start, start + 1)
-        return
-    # Schema and integration sections need more room than a three-section chunk allows.
-    for start, end in ((0, 3), (3, 5), (5, 6), (6, 8), (8, 9), (9, 12), (12, 14)):
-        yield await generate_prd_chunk(provider, api_key, base_url, model, project, language, start, end)
+        ranges = [(s, s + 1) for s in range(len(REQUIRED_PRD_HEADINGS))]
+    else:
+        # Schema and integration sections need more room than a three-section chunk allows.
+        ranges = ((0, 3), (3, 5), (5, 6), (6, 8), (8, 9), (9, 12), (12, 14))
+    for start, end in ranges:
+        deps = build_dependency_context(compiled, start, end)
+        proj = dict(project)
+        if deps:
+            proj["_dependency_context"] = deps
+        chunk = await generate_prd_chunk(provider, api_key, base_url, model, proj, language, start, end)
+        update_compiled(compiled, chunk, start, end)
+        yield chunk
 
 
 async def run_generation_job(job_id: str, generation_type: str, project: dict, user: dict, system_msg: str, user_msg: str, language: str):
@@ -1255,9 +1529,12 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
         })
 
 
-def start_generation_job(generation_type: str, project: dict, user: dict, system_msg: str, user_msg: str, language: str):
+def start_generation_job(generation_type: str, project: dict, user: dict, system_msg: str, user_msg: str, language: str, canonical_spec: Optional[CanonicalProductSpec] = None):
     job_id = str(uuid.uuid4())
-    GENERATION_JOBS[job_id] = {"status": "running", "content": "", "error": None, "user_id": user["user_id"]}
+    GENERATION_JOBS[job_id] = {
+        "status": "running", "content": "", "error": None, "user_id": user["user_id"],
+        "canonical_spec": canonical_spec.model_dump() if canonical_spec else None,
+    }
     if len(GENERATION_JOBS) > 100:
         for k in [k for k, v in GENERATION_JOBS.items() if v["status"] != "running"][:50]:
             GENERATION_JOBS.pop(k, None)
@@ -1494,7 +1771,11 @@ async def generate_prd(project_id: str, body: GenerateRequest, user: dict = Depe
     project = await db.projects.find_one({"id": project_id, "user_id": user["user_id"]}, {"_id": 0})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    job_id = start_generation_job("prd", project, user, PRD_SYSTEM, prd_user_prompt(project, body.language), body.language)
+    try:
+        spec = build_and_validate_project_spec(project)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    job_id = start_generation_job("prd", project, user, PRD_SYSTEM, prd_user_prompt(project, body.language), body.language, canonical_spec=spec)
     return {"job_id": job_id}
 
 
@@ -1507,8 +1788,13 @@ async def generate_agent_prompt(project_id: str, body: GenerateRequest, user: di
     prd = await db.prd_documents.find_one({"project_id": project_id}, {"_id": 0}, sort=[("version", -1)])
     if not prd:
         raise HTTPException(status_code=400, detail="Generate the PRD first")
+    try:
+        spec = build_and_validate_project_spec(project)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     job_id = start_generation_job("agent_prompt", project, user, PROMPT_SYSTEM,
-                                  agent_prompt_user_prompt(project, prd["content"], body.language), body.language)
+                                  agent_prompt_user_prompt(project, prd["content"], body.language), body.language,
+                                  canonical_spec=spec)
     return {"job_id": job_id}
 
 

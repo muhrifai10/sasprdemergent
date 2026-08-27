@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 import server
 from server import PRD_SECTIONS, REQUIRED_PRD_HEADINGS, validate_prd_content
@@ -869,3 +870,383 @@ def test_stream_prd_passes_project_to_canonical_spec(monkeypatch):
         return [chunk async for chunk in server.stream_prd("9router", "key", "url", "model", {"name": "Toko", "preferred_technology": "Laravel"}, "id", "system", "user")]
     asyncio.run(collect())
     assert calls and all("name" in c and c["name"] == "Toko" for c in calls)
+
+
+# ---------- Phase 1: deterministic domain gating ----------
+# Commerce rules must reach ONLY commerce-domain projects, never leak into SaaS /
+# internal tools / generic projects unless the user explicitly asks for them.
+
+COMMERCE_RULE_MARKERS = (
+    "checkout", "inventory", "stock", "shipping", "shipped", "delivered",
+    "public_order_token", "model a", "model b", "reservation",
+)
+
+
+def _rules_lower(project):
+    return server.canonical_mvp_decisions(project).lower()
+
+
+def test_infer_domain_saas_is_generic():
+    saas = {"name": "SaaS CRM", "product_type": "SaaS",
+            "description": "Sistem manajemen relasi pelanggan", "business_goal": "retensi pelanggan",
+            "preferred_technology": "Next.js + PostgreSQL"}
+    assert server.infer_domain(saas) == "generic"
+
+
+def test_infer_domain_ecommerce_is_commerce():
+    ecom = {"name": "Toko Online", "product_type": "E-Commerce",
+            "description": "Jualan produk dengan katalog dan keranjang",
+            "desired_features": "Katalog produk, keranjang, checkout, pembayaran, pengiriman"}
+    assert server.infer_domain(ecom) == "commerce"
+
+
+def test_infer_domain_internal_tool_is_generic():
+    tool = {"name": "Tool Internal HR", "description": "Dashboard absensi karyawan",
+            "target_users": "Karyawan", "auth_requirement": "Login karya wan Google"}
+    assert server.infer_domain(tool) == "generic"
+
+
+def test_saas_excludes_commerce_rules():
+    saas = {"name": "SaaS CRM", "product_type": "SaaS",
+            "description": "CRM untuk tenant", "business_goal": "retensi",
+            "preferred_technology": "Next.js + PostgreSQL"}
+    rules = _rules_lower(saas)
+    # No commerce rule may leak into a non-commerce project.
+    assert not any(marker in rules for marker in COMMERCE_RULE_MARKERS)
+
+
+def test_internal_tool_excludes_commerce_rules():
+    tool = {"name": "Tool Internal", "description": "Dashboard absensi",
+            "target_users": "Karyawan", "auth_requirement": "Login Google"}
+    rules = _rules_lower(tool)
+    assert not any(marker in rules for marker in COMMERCE_RULE_MARKERS)
+
+
+def test_ecommerce_includes_commerce_rules():
+    ecom = {"name": "Toko Online", "product_type": "E-Commerce",
+            "description": "Jual produk dengan katalog dan keranjang",
+            "desired_features": "Katalog, keranjang, checkout, stok, pengiriman"}
+    rules = _rules_lower(ecom)
+    assert "checkout" in rules and "reservation" in rules and "shipped" in rules
+
+
+def test_saas_with_explicit_checkout_request_gets_commerce_rules():
+    # User EXPLICITLY asks for checkout on a SaaS product => commerce rules allowed.
+    saas = {"name": "SaaS", "product_type": "SaaS", "description": "Layanan SaaS",
+            "desired_features": "Tambah fitur checkout dan keranjang untuk order produk"}
+    assert server.infer_domain(saas) == "commerce"
+    rules = _rules_lower(saas)
+    assert "checkout" in rules
+
+
+def test_custom_project_uses_only_relevant_rules():
+    # Custom project with no commerce signals => generic, no commerce rules.
+    custom = {"name": "Custom", "description": "Aplikasi management warehouse",
+              "business_goal": "efisiensi operasional", "integrations": "Email + Excel"}
+    assert server.infer_domain(custom) == "generic"
+    rules = _rules_lower(custom)
+    assert not any(marker in rules for marker in COMMERCE_RULE_MARKERS)
+
+
+# ---------- Phase 2: canonical product spec (structured source of truth) ----------
+
+def test_build_canonical_spec_from_project():
+    p = {"name": "Toko Online", "product_type": "E-Commerce",
+         "preferred_technology": "Laravel + MySQL", "payment_requirement": "Midtrans Snap",
+         "auth_requirement": "Login email", "integrations": "S3 + Midtrans", "business_goal": "jualan"}
+    spec = server.build_canonical_spec(p)
+    assert spec.product == "Toko Online"
+    assert spec.domain == "commerce"
+    assert spec.technology == "Laravel + MySQL"
+    assert spec.database == "MySQL"
+    assert spec.payments == "Midtrans"
+
+
+def test_canonical_spec_has_valid_structure():
+    spec = server.build_canonical_spec({"name": "X", "product_type": "SaaS"})
+    assert isinstance(spec, server.CanonicalProductSpec)
+    data = spec.model_dump()
+    for key in ("product", "domain", "technology", "database", "payments",
+                "infrastructure", "storage", "explicit_decisions",
+                "assumptions", "unknown"):
+        assert key in data
+    assert spec.domain in {"commerce", "generic"}
+
+
+def test_explicit_user_decision_preserved():
+    p = {"name": "SaaS", "product_type": "SaaS",
+         "preferred_technology": "Next.js + PostgreSQL", "auth_requirement": "NextAuth Credentials"}
+    spec = server.build_canonical_spec(p)
+    assert spec.explicit_decisions["Technology"] == "Next.js + PostgreSQL"
+    assert spec.explicit_decisions["Authentication"] == "NextAuth Credentials"
+    assert server.validate_project_spec(p) == []
+
+
+def test_canonical_spec_domain_gating_matches_phase1():
+    saas = {"name": "SaaS CRM", "product_type": "SaaS", "description": "CRM untuk tenant"}
+    ecom = {"name": "Toko", "product_type": "E-Commerce", "description": "jual produk"}
+    assert server.build_canonical_spec(saas).domain == "generic"
+    assert server.build_canonical_spec(ecom).domain == "commerce"
+
+
+def test_saas_canonical_spec_no_commerce_decision():
+    saas = {"name": "SaaS CRM", "product_type": "SaaS", "description": "CRM untuk tenant",
+            "preferred_technology": "Next.js + PostgreSQL"}
+    spec = server.build_canonical_spec(saas)
+    assert spec.domain == "generic"
+    # Commerce rule text must not leak into the spec-bearing prompt.
+    assert "checkout" not in server.render_canonical_spec(spec).lower()
+
+
+def test_ecommerce_canonical_spec_keeps_commerce_decision():
+    ecom = {"name": "Toko", "product_type": "E-Commerce", "description": "jual produk dengan checkout"}
+    assert server.build_canonical_spec(ecom).domain == "commerce"
+    assert "checkout" in server.canonical_mvp_decisions(ecom)
+
+
+def test_technology_decision_consistent():
+    p = {"name": "X", "preferred_technology": "Next.js + PostgreSQL"}
+    spec = server.build_canonical_spec(p)
+    assert spec.database == "PostgreSQL"
+    assert server.validate_project_spec(p) == []
+
+
+def test_payment_decision_consistent():
+    # One provider => no issue.
+    p = {"name": "X", "payment_requirement": "Midtrans"}
+    assert server.validate_project_spec(p) == []
+
+
+def test_database_decision_consistent():
+    assert server.validate_project_spec({"name": "X", "preferred_technology": "PostgreSQL"}) == []
+
+
+def test_infrastructure_decision_consistent():
+    assert server.validate_project_spec({"name": "X", "deployment_preference": "Vercel"}) == []
+
+
+def test_canonical_spec_used_by_section_generation():
+    saas = {"name": "SaaS CRM", "product_type": "SaaS", "description": "CRM untuk tenant",
+            "preferred_technology": "Next.js + PostgreSQL"}
+    prompt = server.prd_chunk_user_prompt(saas, "id", 0, 1)
+    assert "FROZEN CANONICAL SPEC" in prompt
+    assert "Domain (detected): generic" in prompt
+    assert "Next.js + PostgreSQL" in prompt
+
+
+# ---------- Phase 2: regression tests from the audit ----------
+
+def test_regression_stripe_vs_midtrans():
+    issues = server.validate_project_spec({"name": "X", "payment_requirement": "Stripe and Midtrans"})
+    assert any("Payment provider inconsistent" in i for i in issues)
+
+
+def test_regression_vercel_vs_aws_ecs():
+    issues = server.validate_project_spec({"name": "X", "deployment_preference": "Vercel / AWS ECS"})
+    assert any("Infrastructure inconsistent" in i for i in issues)
+
+
+def test_regression_s3_vs_cloudinary():
+    issues = server.validate_project_spec({"name": "X", "integrations": "S3 and Cloudinary"})
+    assert any("Storage inconsistent" in i for i in issues)
+
+
+def test_regression_shipped_delivered_not_on_non_commerce():
+    # SHIPPED/DELIVERED (commerce status vocab) must not be forced on a non-commerce spec.
+    saas = {"name": "SaaS CRM", "product_type": "SaaS", "description": "CRM untuk tenant"}
+    rules = server.canonical_mvp_decisions(saas).lower()
+    assert "shipped" not in rules and "delivered" not in rules
+
+
+def test_regression_ai_generator_not_forced_into_non_goals():
+    # The spec must never invent a Non-Goals entry by itself (that was a prompt-level
+    # symptom). A product that IS an AI generator stays honest: no fabricated non-goal.
+    p = {"name": "PRD Generator", "product_type": "AI",
+         "description": "Menghasilkan PRD untuk pengguna", "desired_features": "generate prd"}
+    spec = server.build_canonical_spec(p)
+    assert spec.non_goals == ""
+    assert spec.features == p["desired_features"]
+
+
+# ---------- Phase 2.1: validation gate before the generation job ----------
+
+def _mock_generation_env(monkeypatch, project, prd=None):
+    """Stub out the DB collections + plan limit so generate_prd / generate_agent_prompt
+    can be driven directly. start_generation_job is recorded (never runs the real job)."""
+    class _Col:
+        def __init__(self, doc):
+            self._doc = doc
+        async def find_one(self, *a, **k):
+            return self._doc
+
+    class _Db:
+        def __init__(self):
+            self.projects = _Col(project)
+            self.prd_documents = _Col(prd)
+
+    monkeypatch.setattr(server, "db", _Db())
+    async def _limit(*a, **k):
+        return None
+    monkeypatch.setattr(server, "check_generation_limit", _limit)
+    calls = []
+    def _start(*a, **k):
+        calls.append(k)
+        return "JOB-1"
+    monkeypatch.setattr(server, "start_generation_job", _start)
+    return calls
+
+
+def test_valid_canonical_spec_allows_generation(monkeypatch):
+    project = {"name": "SaaS CRM", "product_type": "SaaS", "description": "CRM untuk tenant",
+               "preferred_technology": "Next.js + PostgreSQL"}
+    calls = _mock_generation_env(monkeypatch, project)
+    out = asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert out["job_id"] == "JOB-1"
+    assert calls and calls[0].get("canonical_spec") is not None
+
+
+def test_invalid_canonical_spec_stops_generation(monkeypatch):
+    project = {"name": "X", "payment_requirement": "Stripe and Midtrans"}
+    calls = _mock_generation_env(monkeypatch, project)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert e.value.status_code == 422
+    assert calls == []
+
+
+def test_invalid_technology_conflict_rejects_before_ai(monkeypatch):
+    project = {"name": "X", "preferred_technology": "Laravel / React"}
+    calls = _mock_generation_env(monkeypatch, project)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert e.value.status_code == 422
+    assert calls == []
+
+
+def test_invalid_payment_conflict_rejects_before_ai(monkeypatch):
+    project = {"name": "X", "payment_requirement": "Stripe / Midtrans"}
+    calls = _mock_generation_env(monkeypatch, project)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert e.value.status_code == 422
+    assert calls == []
+
+
+def test_invalid_infrastructure_conflict_rejects_before_ai(monkeypatch):
+    project = {"name": "X", "deployment_preference": "Vercel / AWS ECS"}
+    calls = _mock_generation_env(monkeypatch, project)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert e.value.status_code == 422
+    assert calls == []
+
+
+def test_agent_prompt_gate_also_rejects_invalid_spec(monkeypatch):
+    project = {"name": "X", "payment_requirement": "Stripe / Midtrans"}
+    calls = _mock_generation_env(monkeypatch, project, prd={"content": "PRD"})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.generate_agent_prompt("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert e.value.status_code == 422
+    assert calls == []
+
+
+# ---------- Phase 3: dependency-aware section generation ----------
+
+def _p(project, deps):
+    p = dict(project)
+    if deps:
+        p["_dependency_context"] = deps
+    return p
+
+
+def test_section_receives_dependency_context_from_earlier_section():
+    fr = server.summarize_section(3, "## 4. Functional Requirements\nFR-1 User creates account\nFR-2 User checkout\nRoles: customer, admin")
+    deps = server.build_dependency_context({3: fr}, 5, 6)          # data model depends on [2,3,4]
+    assert 3 in deps
+    prompt = server.prd_chunk_user_prompt(_p({"name": "X"}, deps), "id", 5, 6)
+    assert "STRUCTURED DEPENDENCY CONTEXT" in prompt
+    assert "FR-1" in prompt and "FR-2" in prompt
+
+
+def test_dependency_context_is_structured_state():
+    s = server.summarize_section(3, "## 4. Functional Requirements\nFR-1 A\nFR-2 B\nRoles: admin\nEntities: orders")
+    assert isinstance(s, dict)
+    for key in ("requirements", "roles", "entities", "apis", "integrations", "business_rules"):
+        assert key in s
+    assert s["requirements"] == ["FR-1", "FR-2"]
+    assert "admin" in s["roles"]
+    assert "orders" in s["entities"]
+
+
+def test_canonical_spec_identical_across_chunks():
+    p = {"name": "X", "preferred_technology": "Next.js + PostgreSQL", "payment_requirement": "Midtrans"}
+    p_with_ctx = _p(p, {3: {"requirements": ["FR-1"]}})
+    assert server.canonical_project_decisions(p) == server.canonical_project_decisions(p_with_ctx)
+
+
+def test_section_cannot_change_canonical_decision():
+    deps = {3: {"requirements": ["FR-1"]}}
+    text = server.render_dependency_context(deps)
+    assert "do NOT change them" in text
+    prompt = server.prd_chunk_user_prompt(_p({"name": "X", "payment_requirement": "Midtrans"}, deps), "id", 3, 4)
+    assert "single source of truth" in prompt.lower()
+
+
+def test_functional_requirements_to_data_model_consistency():
+    compiled = {3: server.summarize_section(3, "## 4. Functional Requirements\nFR-1 create account\nFR-2 place order")}
+    deps = server.build_dependency_context(compiled, 5, 6)
+    text = server.render_dependency_context(deps)
+    assert "FR-1" in text and "FR-2" in text
+
+
+def test_data_model_to_api_consistency():
+    compiled = {5: server.summarize_section(5, "## 6. Data Model\norders table (id, user_id)\nproducts (id, sku)")}
+    deps = server.build_dependency_context(compiled, 6, 8)
+    text = server.render_dependency_context(deps)
+    assert "orders" in text and "products" in text
+
+
+def test_roles_to_permissions_consistency():
+    compiled = {2: server.summarize_section(2, "## 3. Users, Roles, and Core Journeys\nRoles: admin, customer, tenant")}
+    deps = server.build_dependency_context(compiled, 7, 8)
+    text = server.render_dependency_context(deps)
+    assert "admin" in text and "customer" in text
+
+
+def test_api_to_testing_traceable():
+    compiled = {6: server.summarize_section(6, "## 7. API Specification\nPOST /api/orders\nGET /api/products")}
+    deps = server.build_dependency_context(compiled, 11, 12)
+    text = server.render_dependency_context(deps)
+    assert "POST /api/orders" in text and "GET /api/products" in text
+
+
+def test_section_not_given_irrelevant_dependency():
+    compiled = {6: server.summarize_section(6, "## 7. API Specification\nPOST /api/x")}
+    # data model (5) depends on [2,3,4]; the API section (6) must NOT leak into it.
+    deps = server.build_dependency_context(compiled, 5, 6)
+    assert 6 not in (deps or {})
+
+
+def test_dependency_context_not_full_raw_document():
+    big_body = "## 4. Functional Requirements\n" + "FR-1 some requirement text here. " * 40
+    compiled = {3: server.summarize_section(3, big_body)}
+    text = server.render_dependency_context(server.build_dependency_context(compiled, 5, 6))
+    assert len(text) < 1200
+    assert "some requirement text here" not in text  # never the raw body
+
+
+def test_phase3_saas_no_commerce_rules_in_dependency_prompt():
+    saas = {"name": "SaaS CRM", "product_type": "SaaS", "description": "CRM untuk tenant",
+            "preferred_technology": "Next.js + PostgreSQL"}
+    p = server.prd_chunk_user_prompt(saas, "id", 3, 4).lower()
+    assert "checkout" not in p and "shipped" not in p and "inventory" not in p
+    assert "postgresql" in p
+
+
+def test_phase3_regression_payment_and_storage_preserved():
+    p = {"name": "SaaS Billing", "product_type": "SaaS", "description": "billing subscription",
+         "preferred_technology": "Next.js + PostgreSQL", "payment_requirement": "Midtrans"}
+    prompt = server.prd_chunk_user_prompt(p, "id", 3, 4)
+    assert "Payment (frozen): Midtrans" in prompt
+    # Canonical anti-mix rule guards against Stripe; no Stripe-only section invented.
+    assert "Stripe and Midtrans" in prompt
