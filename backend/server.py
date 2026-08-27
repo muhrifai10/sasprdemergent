@@ -341,23 +341,29 @@ async def logout(request: Request, response: Response):
 
 # ---------- Projects ----------
 def project_context(p: dict) -> str:
-    fields = [
-        ("Project Name", p.get("name")),
-        ("Description", p.get("description")),
-        ("Product Type", p.get("product_type")),
-        ("Target Users", p.get("target_users")),
-        ("Business Goal", p.get("business_goal")),
-        ("Main Problem", p.get("main_problem")),
-        ("Desired Features", p.get("desired_features")),
-        ("Preferred Technology", p.get("preferred_technology")),
-        ("Design Preference", p.get("design_preference")),
-        ("Authentication Requirement", p.get("auth_requirement")),
-        ("Payment Requirement", p.get("payment_requirement")),
-        ("Third-party Integrations", p.get("integrations")),
-        ("Deployment Preference", p.get("deployment_preference")),
-        ("Additional Requirements", p.get("additional_requirements")),
-    ]
-    return "\n".join(f"- {k}: {v}" for k, v in fields if v)
+    canonical = None
+    if p.get("discovery_status") == "confirmed" or p.get("_frozen_canonical_spec"):
+        canonical = build_canonical_spec(p)
+    values = {
+        "Project Name": canonical.product if canonical else p.get("name"),
+        "Description": canonical.business_goal if canonical else p.get("description"),
+        "Product Type": canonical.product_type if canonical else p.get("product_type"),
+        "Target Users": canonical.target_users if canonical else p.get("target_users"),
+        "Business Goal": canonical.business_goal if canonical else p.get("business_goal"),
+        "Main Problem": canonical.scope if canonical else p.get("main_problem"),
+        "Desired Features": canonical.features if canonical else p.get("desired_features"),
+        "Roles and Permissions": canonical.roles if canonical else p.get("roles_permissions"),
+        "Workflows": canonical.workflows if canonical else p.get("workflow"),
+        "Business Rules": canonical.business_rules if canonical else p.get("business_rules"),
+        "Preferred Technology": canonical.technology if canonical else p.get("preferred_technology"),
+        "Design Preference": p.get("design_preference"),
+        "Authentication Requirement": canonical.authentication if canonical else p.get("auth_requirement"),
+        "Payment Requirement": canonical.payments if canonical else p.get("payment_requirement"),
+        "Third-party Integrations": canonical.integrations if canonical else p.get("integrations"),
+        "Deployment Preference": canonical.infrastructure if canonical else p.get("deployment_preference"),
+        "Additional Requirements": canonical.constraints if canonical else p.get("additional_requirements"),
+    }
+    return "\n".join(f"- {k}: {v}" for k, v in values.items() if v)
 
 
 # ---------- CanonicalProductSpec (structured source of truth) ----------
@@ -389,9 +395,20 @@ class CanonicalProductSpec(BaseModel):
     integrations: str = ""
     notifications: str = ""
     constraints: str = ""
+    workflows: str = ""
+    business_rules: str = ""
+    inventory: str = ""
+    shipping: str = ""
+    marketplace: str = ""
+    online_store: str = ""
+    ai_capability: str = ""
+    document_input: str = ""
     explicit_decisions: dict[str, str] = Field(default_factory=dict)
     assumptions: list[str] = Field(default_factory=list)
     unknown: list[str] = Field(default_factory=list)
+    inferred: list[str] = Field(default_factory=list)
+    not_required: list[str] = Field(default_factory=list)
+    field_provenance: dict[str, dict] = Field(default_factory=dict)
 
 
 _EXPLICIT_LABELS = (
@@ -443,8 +460,108 @@ def _canonical(pattern: re.Pattern, text: str, mapping: dict) -> str:
     return ", ".join(dict.fromkeys(mapping.get(m.lower(), m) for m in _collect(pattern, text)))
 
 
+_D06_SNAPSHOT_FIELDS = {
+    "product": "name", "product_type": "product_type", "purpose": "description", "target_users": "target_users",
+    "business_goal": "business_goal",
+    "core_features": "desired_features", "roles": "roles_permissions", "workflows": "workflow",
+    "business_rules": "business_rules", "authentication": "auth_requirement", "payment": "payment_requirement",
+    "inventory": "inventory", "integrations": "integrations", "storage": "storage",
+    "technology": "preferred_technology", "infrastructure": "deployment_preference", "constraints": "constraints",
+    "non_goals": "non_goals", "ai_capability": "ai_capability", "document_input": "document_input",
+    "shipping": "shipping",
+}
+_D06_CANONICAL_FIELDS = {
+    "product": "product", "product_type": "product_type", "purpose": "business_goal", "target_users": "target_users",
+    "business_goal": "business_goal",
+    "core_features": "features", "roles": "roles", "workflows": "workflows", "business_rules": "business_rules",
+    "authentication": "authentication", "payment": "payments", "inventory": "inventory", "integrations": "integrations",
+    "storage": "storage", "technology": "technology", "infrastructure": "infrastructure", "constraints": "constraints",
+    "non_goals": "non_goals", "ai_capability": "ai_capability", "document_input": "document_input",
+    "shipping": "shipping", "marketplace": "marketplace", "online_store": "online_store",
+}
+_D06_ANSWER_KEYS = {
+    "product_type": "product_type", "target_users": "target_users", "business_goal": "business_goal",
+    "desired_features": "core_features", "workflow": "workflows", "roles_permissions": "roles",
+    "business_rules": "business_rules", "preferred_technology": "technology", "auth_requirement": "authentication",
+    "payment_requirement": "payment", "inventory": "inventory", "integrations": "integrations", "storage": "storage",
+    "deployment_preference": "infrastructure", "constraints": "constraints", "non_goals": "non_goals",
+    "ai_capability": "ai_capability", "document_input": "document_input",
+}
+
+
+def canonical_project_input(project: dict) -> tuple[dict, dict[str, dict]]:
+    """Return the frozen discovery projection and provenance for canonicalization."""
+    source = deepcopy(project)
+    discovery = source.get("discovery") or {}
+    snapshot = discovery.get("confirmation_snapshot") if project.get("discovery_status") == "confirmed" else None
+    original = (snapshot or {}).get("original_project_fields") or {}
+    source.update(original)
+    items = ((snapshot or {}).get("summary") or {}).get("summary") or {}
+    for answer in ((snapshot or {}).get("answers") or {}).values():
+        key = _D06_ANSWER_KEYS.get(answer.get("category"))
+        if key:
+            items[key] = answer
+    provenance = {}
+    for key, field in _D06_SNAPSHOT_FIELDS.items():
+        item = items.get(key) or {}
+        canonical_field = _D06_CANONICAL_FIELDS.get(key)
+        if not canonical_field:
+            continue
+        status = item.get("status")
+        value = item.get("value")
+        original_value = original.get(field)
+        if status == "CONFIRMED" and value:
+            source[field] = value
+            provenance[canonical_field] = {"value": value, "status": "CONFIRMED", "source": item.get("source", "DISCOVERY_ANSWER"),
+                                           "source_id": item.get("source_id"), "original_value": original_value}
+        elif status == "NOT_REQUIRED":
+            source[field] = ""
+            provenance[canonical_field] = {"value": "", "status": "NOT_REQUIRED", "source": item.get("source", "DISCOVERY_ANSWER"),
+                                           "source_id": item.get("source_id"), "original_value": original_value}
+        elif status == "INFERRED" and not original_value:
+            source[field] = ""
+            provenance[canonical_field] = {"value": value or "", "status": "INFERRED", "source": "INFERENCE",
+                                           "source_id": item.get("source_id")}
+        elif status == "UNKNOWN" and not original_value:
+            source[field] = ""
+            provenance[canonical_field] = {"value": "", "status": "UNKNOWN", "source": "UNKNOWN", "source_id": item.get("source_id")}
+        elif source.get(field):
+            provenance[canonical_field] = {"value": source[field], "status": "CONFIRMED", "source": "USER_INPUT", "source_id": field,
+                                           "discovery_status": status or "UNKNOWN"}
+        else:
+            provenance[canonical_field] = {"value": "", "status": "UNKNOWN", "source": "UNKNOWN", "source_id": None}
+
+    scope = ((snapshot or {}).get("summary") or {}).get("scope", {})
+    for item in scope.get("in_scope", []) + scope.get("out_of_scope", []):
+        key = item.get("key")
+        if key in {"shipping", "marketplace", "online_store"}:
+            status = item.get("status", "CONFIRMED")
+            value = item.get("value") or ""
+            source[key] = value if status == "CONFIRMED" else ""
+            provenance[key] = {"value": source[key], "status": status, "source": item.get("source", "DOMAIN_RULE"),
+                               "source_id": item.get("source_id")}
+    if not snapshot:
+        for key, field in _D06_SNAPSHOT_FIELDS.items():
+            canonical_field = _D06_CANONICAL_FIELDS.get(key)
+            if not canonical_field:
+                continue
+            provenance[canonical_field] = {
+                "value": source.get(field) or "", "status": "CONFIRMED" if source.get(field) else "UNKNOWN",
+                "source": "USER_INPUT" if source.get(field) else "UNKNOWN", "source_id": field if source.get(field) else None,
+            }
+    return source, provenance
+
+
+def _d06_not_required(provenance: dict, field: str) -> bool:
+    return provenance.get(field, {}).get("status") == "NOT_REQUIRED"
+
+
 def build_canonical_spec(project: dict) -> CanonicalProductSpec:
-    get = project.get
+    frozen = project.get("_frozen_canonical_spec")
+    if frozen:
+        return CanonicalProductSpec.model_validate(deepcopy(frozen))
+    source, provenance = canonical_project_input(project)
+    get = source.get
     tech = get("preferred_technology") or ""
     auth = get("auth_requirement") or ""
     pay_raw = get("payment_requirement") or ""
@@ -455,21 +572,36 @@ def build_canonical_spec(project: dict) -> CanonicalProductSpec:
 
     return CanonicalProductSpec(
         product=get("name") or "",
-        domain=infer_domain(project),
+        domain=infer_domain(source),
         product_type=get("product_type") or "",
         target_users=get("target_users") or "",
-        business_goal=get("business_goal") or "",
+        business_goal=get("business_goal") or get("description") or "",
         scope=get("main_problem") or "",
         features=get("desired_features") or "",
+        roles=get("roles") or get("roles_permissions") or "",
+        permissions=get("permissions") or get("roles_permissions") or "",
         authentication=auth,
         technology=tech,
         database=_canonical(_DB_RE, tech, _DB_CANON),
         infrastructure=_canonical(_INFRA_RE, (deploy + " " + tech), _INFRA_CANON),
-        payments=_canonical(_PAY_RE, pay_raw, _PAY_CANON),
-        storage=_canonical(_STOR_RE, integ, _STOR_CANON),
+        payments="" if _d06_not_required(provenance, "payments") else (_canonical(_PAY_RE, pay_raw, _PAY_CANON) or pay_raw),
+        storage="" if _d06_not_required(provenance, "storage") else (_canonical(_STOR_RE, get("storage") or integ, _STOR_CANON) or get("storage") or ""),
         password_hashing=_canonical(_HASH_RE, (auth + " " + tech + " " + (get("additional_requirements") or "")), _HASH_CANON),
         integrations=integ,
-        constraints=get("additional_requirements") or "",
+        constraints=get("constraints") or get("additional_requirements") or "",
+        non_goals=get("non_goals") or "",
+        workflows=get("workflow") or "",
+        business_rules=get("business_rules") or "",
+        inventory=get("inventory") or "",
+        shipping=get("shipping") or "",
+        marketplace=get("marketplace") or "",
+        online_store=get("online_store") or "",
+        ai_capability=get("ai_capability") or "",
+        document_input=get("document_input") or "",
+        unknown=[field for field, item in provenance.items() if item.get("status") == "UNKNOWN"],
+        inferred=[field for field, item in provenance.items() if item.get("status") == "INFERRED"],
+        not_required=[field for field, item in provenance.items() if item.get("status") == "NOT_REQUIRED"],
+        field_provenance=provenance,
         explicit_decisions=explicit,
     )
 
@@ -483,7 +615,23 @@ def render_canonical_spec(spec: CanonicalProductSpec) -> str:
             lines.append(f"- {label} (frozen): {spec.explicit_decisions[label]}")
     if not lines:
         lines.append("- Canonical spec: none explicitly stated; derive from description with safe defaults, do NOT invent.")
-    lines.append(f"- Domain (detected): {spec.domain}")
+    canonical_fields = (
+        ("Product", spec.product), ("Domain (detected)", spec.domain), ("Product type", spec.product_type),
+        ("Target users", spec.target_users), ("Business goal", spec.business_goal), ("Scope", spec.scope),
+        ("Features", spec.features), ("Roles", spec.roles), ("Workflows", spec.workflows),
+        ("Business rules", spec.business_rules), ("Authentication", spec.authentication),
+        ("Technology", spec.technology), ("Database", spec.database), ("Infrastructure", spec.infrastructure),
+        ("Payments", spec.payments), ("Storage", spec.storage), ("Integrations", spec.integrations),
+        ("Constraints", spec.constraints), ("Non-goals", spec.non_goals), ("AI capability", spec.ai_capability),
+        ("Document input", spec.document_input),
+    )
+    lines.extend(f"- {label}: {value}" for label, value in canonical_fields if value)
+    if spec.unknown:
+        lines.append("- Unresolved requirements: remain unknown; do not invent them")
+    if spec.inferred:
+        lines.append("- Inferred requirements: context only, not authoritative")
+    if spec.not_required:
+        lines.append("- Not-required concerns: exclude from MVP")
     return "\n".join(lines)
 
 
@@ -882,7 +1030,7 @@ def _question_category(project: dict, qid: str) -> Optional[str]:
 
 
 def merge_discovery_answers(project: dict) -> dict:
-    """Priority: CONFIRMED answer > existing project field > INFERRED answer. Never invents."""
+    """Priority: CONFIRMED answer > existing project field. Never invents."""
     merged = dict(project)
     answers = _discovery(project).get("answers") or {}
     for qid, ans in answers.items():
@@ -892,8 +1040,6 @@ def merge_discovery_answers(project: dict) -> dict:
         status = ans.get("status", "CONFIRMED")
         value = (ans.get("value") or "").strip()
         if status == "CONFIRMED" and value:
-            merged[field] = ans["value"]
-        elif status == "INFERRED" and not merged.get(field):
             merged[field] = ans["value"]
     return merged
 
@@ -1317,6 +1463,9 @@ def _snapshot_discovery_answers(project: dict) -> dict:
         if answer is None:
             continue
         copied = deepcopy(answer)
+        copied["category"] = q.get("category")
+        copied["source"] = "DISCOVERY_ANSWER"
+        copied["source_id"] = qid
         if any(term in str(q.get("question") or "").lower() for term in _SECRET_TERMS):
             copied["value"] = "[REDACTED]"
         snapshot[qid] = copied
@@ -1419,6 +1568,11 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
     if not check["complete"]:
         blockers = check["required_missing"] + check["conditional_missing"] + check["unknown"] + check["critical_ambiguities"]
         raise HTTPException(status_code=422, detail="Discovery belum lengkap: " + ", ".join(blockers))
+    original_project_fields = {
+        field: deepcopy(project[field])
+        for field in set(_D06_SNAPSHOT_FIELDS.values())
+        if field in project
+    }
     merged = merge_discovery_answers(project)
     updates = {field: merged[field] for field in DISCOVERY_FIELD_MAP.values() if field in merged and merged.get(field)}
     spec = build_canonical_spec(merged)
@@ -1433,6 +1587,7 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
         "answers": _snapshot_discovery_answers(project),
         "summary": deepcopy(understanding),
         "completeness": deepcopy(check),
+        "original_project_fields": original_project_fields,
         "status": "confirmed",
         "confirmed_at": disc["confirmed_at"],
     }
@@ -1997,15 +2152,19 @@ def infer_domain(project: dict) -> str:
     text = " ".join(
         str(project.get(k) or "") for k in (
             "product_type", "description", "desired_features",
-            "additional_requirements", "integrations", "main_problem", "business_goal",
+            "additional_requirements", "integrations", "main_problem", "business_goal", "payment_requirement",
+            "inventory", "shipping", "marketplace", "online_store",
         )
     )
+    if any(str(project.get(k) or "").strip() for k in ("inventory", "shipping", "marketplace", "online_store")):
+        text += " inventory"
     return "commerce" if _COMMERCE_SIGNALS.search(text) else "generic"
 
 
 def canonical_mvp_decisions(project: dict) -> str:
     rules = [CANONICAL_GLOBAL_RULES]
-    if infer_domain(project) == "commerce":
+    domain = build_canonical_spec(project).domain if project.get("discovery_status") == "confirmed" or project.get("_frozen_canonical_spec") else infer_domain(project)
+    if domain == "commerce":
         rules.append(CANONICAL_COMMERCE_RULES)
     return "\n\n".join(rules)
 
@@ -2507,8 +2666,6 @@ Project requirements:
 FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT change them):
 {frozen}
 
-{canonical_mvp_decisions(project)}
-
 {rules}
 
 {dep}
@@ -2526,8 +2683,6 @@ Project requirements:
 
 FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT change them):
 {frozen}
-
-{canonical_mvp_decisions(project)}
 
 {rules}
 
@@ -2627,8 +2782,10 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
         # Phase 5: freeze the generation context ONCE, before any provider runs, so a
         # fallback provider receives the IDENTICAL canonical spec + domain rules, never a
         # rebuild from the raw project input. Deterministic, immutable, no drift.
+        frozen_spec = build_canonical_spec(project)
+        project["_frozen_canonical_spec"] = frozen_spec.model_dump()
         project.setdefault("_frozen_context", {
-            "frozen": render_canonical_spec(build_canonical_spec(project)),
+            "frozen": render_canonical_spec(frozen_spec),
             "rules": canonical_mvp_decisions(project),
         })
 
@@ -2719,8 +2876,22 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
         })
 
 
+def _freeze_generation_project(project: dict, canonical_spec: CanonicalProductSpec) -> dict:
+    frozen = deepcopy(project)
+    frozen["_frozen_canonical_spec"] = canonical_spec.model_dump()
+    frozen["_frozen_context"] = {
+        "frozen": render_canonical_spec(canonical_spec),
+        "rules": canonical_mvp_decisions(frozen),
+    }
+    return frozen
+
+
 def start_generation_job(generation_type: str, project: dict, user: dict, system_msg: str, user_msg: str, language: str, canonical_spec: Optional[CanonicalProductSpec] = None):
     job_id = str(uuid.uuid4())
+    if canonical_spec:
+        project = _freeze_generation_project(project, canonical_spec)
+    else:
+        project = deepcopy(project)
     GENERATION_JOBS[job_id] = {
         "status": "running", "content": "", "error": None, "user_id": user["user_id"],
         "canonical_spec": canonical_spec.model_dump() if canonical_spec else None,
@@ -2967,7 +3138,8 @@ async def generate_prd(project_id: str, body: GenerateRequest, user: dict = Depe
         spec = build_and_validate_project_spec(project)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    job_id = start_generation_job("prd", project, user, PRD_SYSTEM, prd_user_prompt(project, body.language), body.language, canonical_spec=spec)
+    generation_project = _freeze_generation_project(project, spec)
+    job_id = start_generation_job("prd", generation_project, user, PRD_SYSTEM, prd_user_prompt(generation_project, body.language), body.language, canonical_spec=spec)
     return {"job_id": job_id}
 
 
@@ -2986,8 +3158,9 @@ async def generate_agent_prompt(project_id: str, body: GenerateRequest, user: di
         spec = build_and_validate_project_spec(project)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    job_id = start_generation_job("agent_prompt", project, user, PROMPT_SYSTEM,
-                                  agent_prompt_user_prompt(project, prd["content"], body.language), body.language,
+    generation_project = _freeze_generation_project(project, spec)
+    job_id = start_generation_job("agent_prompt", generation_project, user, PROMPT_SYSTEM,
+                                  agent_prompt_user_prompt(generation_project, prd["content"], body.language), body.language,
                                   canonical_spec=spec)
     return {"job_id": job_id}
 

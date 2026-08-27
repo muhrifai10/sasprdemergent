@@ -2752,3 +2752,73 @@ def test_d05_unauthorized_review_edit_and_confirmation_rejected(monkeypatch):
         with pytest.raises(HTTPException) as error:
             asyncio.run(operation())
         assert error.value.status_code == 404
+
+
+# ---------- D0.6: confirmed discovery -> canonical product spec ----------
+
+def _d06_confirmed_project(**over):
+    p = {
+        "id": "p1", "user_id": "u1", "name": "Original Shop", "description": "sell products online",
+        "target_users": "old users", "desired_features": "old feature", "preferred_technology": "Vue",
+        "payment_requirement": "Stripe", "discovery_status": "confirmed",
+        "discovery": {
+            "questions": [], "answers": {},
+            "confirmation_snapshot": {
+                "original_project_fields": {
+                    "name": "Original Shop", "description": "sell products online", "target_users": "old users",
+                    "desired_features": "old feature", "preferred_technology": "Vue", "payment_requirement": "Stripe",
+                },
+                "summary": {
+                    "summary": {
+                        "target_users": {"key": "target_users", "value": "operators", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER", "source_id": "q_users"},
+                        "technology": {"key": "technology", "value": "Next.js + PostgreSQL", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER", "source_id": "q_tech"},
+                        "payment": {"key": "payment", "value": "Midtrans", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER", "source_id": "q_payment"},
+                    },
+                    "scope": {"out_of_scope": []},
+                },
+                "answers": {}, "status": "confirmed",
+            },
+        },
+    }
+    p.update(over)
+    return p
+
+
+def test_d06_confirmed_snapshot_overrides_live_project_and_is_traceable():
+    project = _d06_confirmed_project()
+    project["target_users"] = "live changed"
+    spec = server.build_canonical_spec(project)
+    assert spec.target_users == "operators"
+    assert spec.technology == "Next.js + PostgreSQL"
+    assert spec.database == "PostgreSQL"
+    assert spec.payments == "Midtrans"
+    assert spec.field_provenance["target_users"]["source_id"] == "q_users"
+    assert spec.field_provenance["technology"]["source"] == "DISCOVERY_ANSWER"
+
+
+def test_d06_inference_is_not_promoted_and_not_required_clears_old_value():
+    project = _d06_confirmed_project()
+    summary = project["discovery"]["confirmation_snapshot"]["summary"]["summary"]
+    summary["roles"] = {"key": "roles", "value": "manager", "status": "INFERRED", "source": "INFERENCE", "source_id": "analysis"}
+    summary["payment"] = {"key": "payment", "value": "", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER", "source_id": "q_payment"}
+    spec = server.build_canonical_spec(project)
+    assert spec.roles == ""
+    assert "roles" in spec.inferred
+    assert spec.payments == ""
+    assert "payments" in spec.not_required
+
+
+def test_d06_legacy_project_keeps_canonical_builder_fallback():
+    spec = server.build_canonical_spec({"name": "Legacy", "payment_requirement": "Midtrans"})
+    assert spec.payments == "Midtrans"
+    assert spec.field_provenance["payments"]["source"] == "USER_INPUT"
+
+
+def test_d06_generation_freeze_survives_live_project_mutation():
+    project = _d06_confirmed_project()
+    spec = server.build_canonical_spec(project)
+    frozen = server._freeze_generation_project(project, spec)
+    frozen["target_users"] = "changed during fallback"
+    assert server.build_canonical_spec(frozen).model_dump() == spec.model_dump()
+    assert "operators" in server.project_context(frozen)
+    assert "changed during fallback" not in server.project_context(frozen)
