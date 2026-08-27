@@ -1,0 +1,31 @@
+.env
+.env.*
+!.env.example
+node_modules/
+vendor/
+__pycache__/
+*.pyc
+.pytest_cache/
+.cache/
+dist/
+build/
+backend/uploads/
+
+# local dev tooling / agent configs (machine-specific)
+.claude/
+.commandcode/
+.emergent/
+.playwright/
+.playwright-cli/
+.venv/
+.venv*/
+
+# build artifacts, binaries, test reports
+*.whl
+test_reports/
+*.log
+
+# local auth/test playbooks and credentials
+auth_testing.md
+test_result.md
+memory/test_credentials.md

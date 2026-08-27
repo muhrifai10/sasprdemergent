@@ -1,0 +1,40 @@
+version: "1"
+
+services:
+  - type: web
+    name: emergent-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: prd_creativeai
+      - key: EMERGENT_LLM_KEY
+        sync: false
+      - key: AI_PROVIDER
+        value: openai
+      - key: AI_MODEL
+        value: gpt-5.4
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: ADMIN_EMAILS
+        sync: false
+
+  - type: web
+    name: emergent-frontend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    autoDeploy: true
+    envVars:
+      - key: BACKEND_URL
+        fromService:
+          type: web
+          name: emergent-backend
+          envVarKey: RENDER_INTERNAL_URL

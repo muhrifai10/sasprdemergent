@@ -1,0 +1,116 @@
+{
+  "theme": "Dark Mode (Swiss Brutalist mixed with Luxury Archetype)",
+  "typography": {
+    "headings": "Cabinet Grotesk",
+    "body": "Manrope",
+    "weights": {
+      "headings": "Light (300) to Black (900) for high contrast and impact",
+      "body": "Regular (400) and Medium (500)"
+    },
+    "rules": "H1 up to text-6xl with tracking-tighter. Never center-align headings blindly; use optical alignment. Strict hierarchy gap rules."
+  },
+  "colors": {
+    "background": "#0A0A0A",
+    "surface": "#121212",
+    "border": "rgba(255, 255, 255, 0.1)",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#A1A1AA",
+    "accent_primary": "#4F46E5",
+    "accent_hover": "#6366F1",
+    "accent_subtle": "rgba(79, 70, 229, 0.1)"
+  },
+  "visual_enhancers": [
+    "Subtle grain texture overlay across the body for tactile luxury.",
+    "Glassmorphism for floating elements: backdrop-blur-xl bg-black/60 border border-white/10.",
+    "1px crisp borders for structured grid layouts (border-white/10) to create a technical, rigorous aesthetic.",
+    "Generous padding (p-12, p-16) to provide breathing room, especially in the marketing sections."
+  ],
+  "components": {
+    "marketing": {
+      "Hero": "Kinetic typography with Framer Motion masked line-by-line reveal on load. Background features subtle parallax. Huge heading, left-aligned.",
+      "Marquee": "Use react-fast-marquee for a slow, editorial ribbon. Pale text on dark background, wide tracking.",
+      "Workflow": "Visual, phased flow from Idea \u2192 PRD \u2192 Prompt \u2192 Frontend \u2192 Backend \u2192 Integration. Use horizontal scrolling or grid layout.",
+      "Features": "Bento Grid protocol (Tetris mode). Mix col-span-4 and col-span-8, gap-8.",
+      "Pricing": "High-contrast cards. The popular tier uses 'Tracing Beam' glow or subtle 1px accent border.",
+      "Testimonials": "Minimal cards with avatar, name, and quote. Left-aligned text."
+    },
+    "saas_dashboard": {
+      "Sidebar": "Fixed left navigation. Minimalist icons with text. Flat aesthetic.",
+      "Project_List": "Cardless grid layout or dense minimalist cards with 1px borders.",
+      "Wizard_Form": "Multi-step 'Create Project' wizard. Clear progress indicators. Use modern input fields.",
+      "PRD_Viewer": "Markdown viewer with sticky table of contents/section navigation on the right side.",
+      "Prompt_Viewer": "Code block container with syntax highlighting and a floating 'Copy' button."
+    }
+  },
+  "grids": {
+    "marketing_bento": "grid-cols-1 md:grid-cols-8 lg:grid-cols-12, wide gaps (gap-8)",
+    "dashboard": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4, tight gaps (gap-4 or gap-6)"
+  },
+  "layouts": {
+    "general": "Mobile-first responsive. Use raw HTML/Tailwind for marketing asymmetry. Use structured components for the SaaS dashboard."
+  },
+  "motion": {
+    "scroll_reveal": "Framer Motion 'whileInView' with opacity and y translate.",
+    "page_scroll": "Lenis for momentum scrolling.",
+    "micro_interactions": "Hover scale (1.02) on cards, button arrow translate-x-1 on hover. Active states on buttons."
+  },
+  "accessibility": {
+    "contrast": "Ensure APCA/WCAG AA contrast. Text on accent buttons must be pure white.",
+    "focus": "High contrast focus rings (focus:ring-2 focus:ring-accent_primary).",
+    "testing": "All interactive elements MUST include data-testid attributes."
+  },
+  "image_urls": [
+    {
+      "url": "https://images.unsplash.com/photo-1560250097-0b93528c311a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzB8MHwxfHNlYXJjaHwzfHxwcm9mZXNzaW9uYWwlMjBwb3J0cmFpdHxlbnwwfHx8fDE3ODcyMDM0NjB8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Professional man standing beside wall",
+      "category": "testimonial"
+    },
+    {
+      "url": "https://images.unsplash.com/photo-1580489944761-15a19d654956?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzB8MHwxfHNlYXJjaHwyfHxwcm9mZXNzaW9uYWwlMjBwb3J0cmFpdHxlbnwwfHx8fDE3ODcyMDM0NjB8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Professional woman in white crew neck shirt smiling",
+      "category": "testimonial"
+    },
+    {
+      "url": "https://images.unsplash.com/photo-1644088379091-d574269d422f?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzR8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMGRhdGElMjB2aXN1YWxpemF0aW9ufGVufDB8fHx8MTc4NzIwMzQ2MXww&ixlib=rb-4.1.0&q=85",
+      "description": "Blue background with lines and dots",
+      "category": "abstract_background"
+    },
+    {
+      "url": "https://images.pexels.com/photos/4884116/pexels-photo-4884116.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Sleek black laptop on a white desk in a minimalist setup",
+      "category": "product_showcase"
+    }
+  ],
+  "libraries": {
+    "icons": "lucide-react",
+    "animation": "framer-motion",
+    "scrolling": "@studio-freight/react-lenis",
+    "marquee": "react-fast-marquee",
+    "notifications": "sonner"
+  },
+  "instructions_to_main_agent": [
+    "Install required packages: npm install framer-motion @studio-freight/react-lenis react-fast-marquee sonner lucide-react clsx tailwind-merge (or use yarn equivalent).",
+    "Implement a language toggle context for ID/EN bilingual content.",
+    "DO NOT use completely transparent backgrounds for the sticky header. Use 'backdrop-blur-xl bg-[#0A0A0A]/60 border-b border-white/10'.",
+    "Hero Section: Implement Framer Motion line-by-line staggered reveal on text elements.",
+    "Workflow Visualization: Represent Idea \u2192 PRD \u2192 Prompt \u2192 Frontend \u2192 Backend \u2192 Integration clearly.",
+    "Testimonials: Use the provided professional portrait image URLs.",
+    "Apply 'data-testid' to EVERY button, link, and form input."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "You tend to converge toward generic, 'on distribution' outputs. Avoid this: make creative, distinctive frontends that surprise and delight.",
+    "Dark colors look good when used independently without gradients. DO NOT use dark colors as gradients.",
+    "Don't make generic centered layouts, simplistic gradients, and uniform styling.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "Use glass-morphism effects with backdrop filters (12-24px blur).",
+    "You MUST NOT apply universal transition (e.g., transition: all). This breaks transforms. Always add transitions for specific properties (transition: transform 0.2s ease, opacity 0.2s ease).",
+    "You MUST NOT center align the app container. Do not add .App { text-align: center; } in the css file.",
+    "Always use modern button styles like pill-shaped or sharp buttons with interaction animations.",
+    "NEVER use AI assistant Emoji characters (like \ud83e\udd16\ud83e\udde0\ud83d\udcad\ud83d\udca1\ud83d\udd2e\ud83c\udfaf) for icons. Use lucide-react.",
+    "Every interaction needs micro-animations - hover states, transitions, parallax effects, and entrance animations.",
+    "Use 2-3x more spacing than feels comfortable. Cramped designs look cheap.",
+    "Subtle grain textures, custom cursors, selection states, and loading animations separate good from extraordinary.",
+    "Prioritize using pre-existing components from src/components/ui when applicable.",
+    "Use 'sonner' for toast notifications."
+  ]
+}
