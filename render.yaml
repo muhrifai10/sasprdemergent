@@ -1,0 +1,26 @@
+version: "1"
+
+services:
+  - type: web
+    name: emergent
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: prd_creativeai
+      - key: EMERGENT_LLM_KEY
+        sync: false
+      - key: AI_PROVIDER
+        value: deepseek
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: ADMIN_EMAILS
+        sync: false
