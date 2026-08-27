@@ -576,11 +576,20 @@ DISCOVERY_FIELD_MAP = {
     "target_users": "target_users",
     "business_goal": "business_goal",
     "desired_features": "desired_features",
+    "workflow": "workflow",
+    "roles_permissions": "roles_permissions",
+    "business_rules": "business_rules",
     "preferred_technology": "preferred_technology",
     "auth_requirement": "auth_requirement",
     "payment_requirement": "payment_requirement",
+    "inventory": "inventory",
     "integrations": "integrations",
+    "storage": "storage",
     "deployment_preference": "deployment_preference",
+    "constraints": "constraints",
+    "non_goals": "non_goals",
+    "ai_capability": "ai_capability",
+    "document_input": "document_input",
 }
 
 DEFAULT_DISCOVERY_QUESTIONS = [
@@ -888,25 +897,258 @@ def merge_discovery_answers(project: dict) -> dict:
     return merged
 
 
+_D04_CATEGORY_FIELDS = {
+    "product_identity": "name",
+    "purpose": "description",
+    "target_users": "target_users",
+    "core_functionality": "desired_features",
+    "workflow": "workflow",
+    "roles_permissions": "roles_permissions",
+    "business_rules": "business_rules",
+    "technology": "preferred_technology",
+    "authentication": "auth_requirement",
+    "payment": "payment_requirement",
+    "inventory": "inventory",
+    "integration": "integrations",
+    "storage": "storage",
+    "deployment": "deployment_preference",
+    "constraints": "constraints",
+    "non_goals": "non_goals",
+    "ai_capability": "ai_capability",
+    "document_input": "document_input",
+}
+_D04_QUESTION_CATEGORIES = {
+    "core_functionality": "desired_features",
+    "technology": "preferred_technology",
+    "authentication": "auth_requirement",
+    "payment": "payment_requirement",
+    "integration": "integrations",
+    "deployment": "deployment_preference",
+}
+_D04_CRITICAL_CATEGORIES = {
+    "target_users", "core_functionality", "workflow", "roles_permissions", "business_rules",
+    "payment", "inventory", "integration", "storage", "ai_capability", "document_input",
+}
+_D04_OPTIONAL_CATEGORIES = {"technology", "deployment", "integration", "constraints", "non_goals"}
+_D04_CRITICAL_AMBIGUITY_TERMS = (
+    "scope", "workflow", "lifecycle", "role", "permission", "access", "transaction", "payment",
+    "inventory", "stock", "order", "assignment", "data model", "integration", "authentication",
+    "user", "feature", "core behavior", "ai capability", "document",
+)
+_D04_MINOR_AMBIGUITY_TERMS = ("color", "chart", "font", "theme", "layout", "cosmetic", "copy")
+_D04_MULTI_ROLE_RE = re.compile(
+    r"\b(admin|administrator|kasir|cashier|manager|staff|operator|customer|client|project manager|team member|member)\b"
+    r"[^.\n]{0,70}\b(and|dan|&|,|atau|or)\b[^.\n]{0,70}\b(admin|administrator|kasir|cashier|manager|staff|operator|customer|client|project manager|team member|member)\b",
+    re.IGNORECASE,
+)
+_D04_PAYMENT_RE = re.compile(r"\b(payment|pembayaran|bayar|checkout|qris|midtrans|stripe|xendit|paypal)\b", re.IGNORECASE)
+_D04_COMMERCE_PAYMENT_RE = re.compile(
+    r"\b(e-commerce|ecommerce|toko|store|retail|checkout|cart|keranjang|order|pesanan|jual|beli|kasir|payment|pembayaran|qris)\b",
+    re.IGNORECASE,
+)
+_D04_INVENTORY_RE = re.compile(r"\b(inventory|inventori|stock|stok|warehouse|gudang|sku|persediaan)\b", re.IGNORECASE)
+_D04_AUTH_RE = re.compile(r"\b(login|log in|sign in|account|akun|authenticated|auth|password)\b", re.IGNORECASE)
+_D04_STORAGE_RE = re.compile(r"\b(upload|unggah|document|dokumen|file|attachment|lampiran|pdf|image|gambar)\b", re.IGNORECASE)
+
+
+def _discovery_category_status(project: dict, category: str) -> str:
+    field = _D04_CATEGORY_FIELDS.get(category)
+    question_category = _D04_QUESTION_CATEGORIES.get(category, category)
+    answers = _discovery(project).get("answers") or {}
+    for q in reversed(_discovery_questions(project)):
+        if q.get("category") != question_category:
+            continue
+        answer = answers.get(q.get("id")) or {}
+        status = answer.get("status")
+        value = str(answer.get("value") or "").strip()
+        if status == "NOT_REQUIRED":
+            return "NOT_REQUIRED"
+        if status == "CONFIRMED" and value:
+            return "CONFIRMED"
+        if status in {"INFERRED", "UNKNOWN"}:
+            return status
+    if field and str(project.get(field) or "").strip():
+        return "CONFIRMED"
+    return "UNKNOWN"
+
+
+def _d04_text(project: dict) -> str:
+    return " ".join(str(project.get(k) or "") for k in (
+        "product_type", "description", "target_users", "desired_features", "main_problem", "business_goal",
+        "auth_requirement", "payment_requirement", "integrations", "additional_requirements",
+        "workflow", "roles_permissions", "business_rules", "inventory", "storage",
+    )).lower()
+
+
+def _d04_gap_category(text: str) -> str | None:
+    low = text.lower()
+    if any(t in low for t in ("target user", "user segment", "who will", "pengguna", "customer segment")):
+        return "target_users"
+    if any(t in low for t in ("feature", "functionality", "core", "mvp")):
+        return "desired_features"
+    if any(t in low for t in ("permission", "role", "access")):
+        return "roles_permissions"
+    if any(t in low for t in ("workflow", "lifecycle", "assignment", "process")):
+        return "workflow"
+    if any(t in low for t in ("inventory", "stock", "stok", "warehouse")):
+        return "inventory"
+    if any(t in low for t in ("payment", "billing", "pembayaran", "checkout")):
+        return "payment_requirement"
+    if any(t in low for t in ("integration", "third-party", "external")):
+        return "integrations"
+    if any(t in low for t in ("document", "file", "upload", "storage")):
+        return "storage"
+    if any(t in low for t in ("auth", "login", "account")):
+        return "auth_requirement"
+    if any(t in low for t in ("business goal", "objective", "purpose")):
+        return "business_goal"
+    return None
+
+
+def _d04_analysis_lists(project: dict) -> tuple[list[str], list[str]]:
+    analysis = (_discovery(project).get("analysis") or {})
+    return (
+        [str(item) for item in analysis.get("missing_requirements") or []],
+        [str(item) for item in analysis.get("ambiguities") or []],
+    )
+
+
+def _d04_negative(value: str) -> bool:
+    return str(value or "").strip().lower() in {"no", "n", "false", "none", "tidak", "tidak perlu", "tanpa"}
+
+
 def completeness_check(project: dict) -> dict:
-    """Deterministic minimum-information check (NOT "PRD complete")."""
+    """Deterministic readiness check for Product Understanding Review, not PRD completion."""
     merged = merge_discovery_answers(project)
+    text = _d04_text(merged)
     domain = infer_domain(merged)
-    result = {"complete": True, "required_missing": [], "conditional_missing": [], "unknown": [], "warnings": []}
-    if not (merged.get("desired_features") or merged.get("description")):
-        result["required_missing"].append("core_functionality")
-    if not merged.get("target_users"):
-        result["required_missing"].append("target_users")
-    if domain == "commerce" and not merged.get("payment_requirement"):
-        result["conditional_missing"].append("payment")
-    if not merged.get("preferred_technology"):
+    statuses = {category: _discovery_category_status(project, category) for category in _D04_CATEGORY_FIELDS}
+    statuses["purpose"] = "CONFIRMED" if (merged.get("description") or merged.get("business_goal") or merged.get("main_problem")) else statuses["purpose"]
+    statuses["shipping"] = "NOT_REQUIRED" if re.search(r"(no|not|tidak|tanpa)\s+(online store|toko online|shipping|pengiriman|marketplace)", text) else "UNKNOWN"
+    if statuses["payment"] == "CONFIRMED" and _d04_negative(merged.get("payment_requirement")):
+        statuses["payment"] = "NOT_REQUIRED"
+
+    required_missing = []
+    if not (merged.get("name") or merged.get("description")):
+        required_missing.append("product_identity")
+    if not (merged.get("description") or merged.get("business_goal") or merged.get("main_problem")):
+        required_missing.append("purpose")
+    if statuses["target_users"] != "CONFIRMED":
+        required_missing.append("target_users")
+    if statuses["core_functionality"] != "CONFIRMED":
+        required_missing.append("core_functionality")
+    if statuses["workflow"] == "INFERRED":
+        required_missing.append("workflow")
+
+    critical_ambiguities = []
+    minor_ambiguities = []
+    _, ai_ambiguities = _d04_analysis_lists(project)
+    for ambiguity in ai_ambiguities:
+        low = ambiguity.lower()
+        if any(term in low for term in _D04_CRITICAL_AMBIGUITY_TERMS):
+            critical_ambiguities.append(ambiguity)
+        elif any(term in low for term in _D04_MINOR_AMBIGUITY_TERMS):
+            minor_ambiguities.append(ambiguity)
+        else:
+            minor_ambiguities.append(ambiguity)
+    if _D04_MULTI_ROLE_RE.search(text) and statuses["roles_permissions"] in {"UNKNOWN", "INFERRED"}:
+        critical_ambiguities.append("roles_permissions is not defined for the multiple user roles")
+
+    conditional_missing = []
+    if _D04_COMMERCE_PAYMENT_RE.search(text) and statuses["payment"] not in {"CONFIRMED", "NOT_REQUIRED"}:
+        conditional_missing.append("payment")
+    payment_active = bool(_D04_COMMERCE_PAYMENT_RE.search(text) or _D04_PAYMENT_RE.search(text))
+    if payment_active and statuses["payment"] == "INFERRED":
+        conditional_missing.append("payment")
+    inventory_active = bool(_D04_INVENTORY_RE.search(text))
+    if not inventory_active and statuses["inventory"] == "UNKNOWN":
+        statuses["inventory"] = "NOT_REQUIRED"
+    if inventory_active and statuses["inventory"] not in {"CONFIRMED", "NOT_REQUIRED"}:
+        conditional_missing.append("inventory")
+    if _D04_AUTH_RE.search(text) and statuses["authentication"] not in {"CONFIRMED", "NOT_REQUIRED"}:
+        conditional_missing.append("authentication")
+    if _D04_STORAGE_RE.search(text) and statuses["storage"] not in {"CONFIRMED", "NOT_REQUIRED"}:
+        conditional_missing.append("storage")
+
+    missing_requirements, _ = _d04_analysis_lists(project)
+    for item in missing_requirements:
+        category = _d04_gap_category(item)
+        if not category:
+            continue
+        state_key = {"desired_features": "core_functionality", "payment_requirement": "payment",
+                     "auth_requirement": "authentication", "integrations": "integration"}.get(category, category)
+        state = statuses.get(state_key, "UNKNOWN")
+        if state in {"CONFIRMED", "NOT_REQUIRED"}:
+            continue
+        if state_key in {"target_users", "core_functionality", "workflow", "roles_permissions", "business_rules"}:
+            required_missing.append(state_key)
+        elif state_key in {"payment", "inventory", "storage", "authentication"}:
+            conditional_missing.append(state_key)
+
+    blocking_unknown = []
+    optional_unknowns = [
+        category for category, status in statuses.items()
+        if status in {"UNKNOWN", "INFERRED"} and category not in {"product_identity", "purpose", "target_users", "core_functionality"}
+    ]
+    active_blocking_categories = {"target_users", "core_functionality"}
+    if "payment" in conditional_missing:
+        active_blocking_categories.add("payment")
+    if "inventory" in conditional_missing:
+        active_blocking_categories.add("inventory")
+    if "authentication" in conditional_missing:
+        active_blocking_categories.add("authentication")
+    if "storage" in conditional_missing:
+        active_blocking_categories.add("storage")
+    question_categories = {question: semantic for semantic, question in _D04_QUESTION_CATEGORIES.items()}
+    question_categories["desired_features"] = "core_functionality"
+    for qid, answer in (_discovery(project).get("answers") or {}).items():
+        if answer.get("status") != "UNKNOWN":
+            continue
+        question = next((q for q in _discovery_questions(project) if q.get("id") == qid), {})
+        category = question_categories.get(question.get("category"), question.get("category"))
+        if category in active_blocking_categories:
+            blocking_unknown.append(qid)
+        elif category:
+            optional_unknowns.append(category)
+    optional_unknowns = list(dict.fromkeys(optional_unknowns))
+
+    required_missing = list(dict.fromkeys(required_missing))
+    conditional_missing = list(dict.fromkeys(conditional_missing))
+    blocking_unknown = list(dict.fromkeys(blocking_unknown))
+    critical_ambiguities = list(dict.fromkeys(critical_ambiguities))
+    optional_unknowns = list(dict.fromkeys(optional_unknowns))
+    next_categories = []
+    for item in required_missing + conditional_missing + critical_ambiguities:
+        category = _d04_gap_category(item) or item
+        category = {
+            "core_functionality": "desired_features",
+            "payment": "payment_requirement",
+            "authentication": "auth_requirement",
+            "integration": "integrations",
+        }.get(category, category)
+        if category not in next_categories:
+            next_categories.append(category)
+
+    result = {
+        "complete": not (required_missing or conditional_missing or blocking_unknown or critical_ambiguities),
+        "readiness": "ready_for_review" if not (required_missing or conditional_missing or blocking_unknown or critical_ambiguities) else "needs_questions",
+        "required_missing": required_missing,
+        "missing_required": required_missing,
+        "conditional_missing": conditional_missing,
+        "unknown": blocking_unknown,
+        "critical_ambiguities": critical_ambiguities,
+        "minor_ambiguities": minor_ambiguities,
+        "optional_unknowns": optional_unknowns,
+        "next_question_categories": next_categories,
+        "category_status": statuses,
+        "information": statuses,
+        "warnings": [],
+    }
+    if statuses["technology"] in {"UNKNOWN", "INFERRED"}:
         result["warnings"].append("technology_unspecified")
-    if not merged.get("deployment_preference"):
+    if statuses["deployment"] in {"UNKNOWN", "INFERRED"}:
         result["warnings"].append("infrastructure_unspecified")
-    for qid, ans in (_discovery(project).get("answers") or {}).items():
-        if ans.get("status") == "UNKNOWN":
-            result["unknown"].append(qid)
-    result["complete"] = not result["required_missing"] and not result["unknown"]
+    result["warnings"].extend(f"minor_ambiguity: {item}" for item in minor_ambiguities)
     return result
 
 
@@ -992,6 +1234,8 @@ async def discovery_answers(project_id: str, body: DiscoveryAnswersRequest, user
     check = completeness_check(project)
     if project.get("discovery_status") == "in_progress" and check["complete"]:
         project["discovery_status"] = transition_discovery_status("in_progress", "awaiting_confirmation")
+    elif project.get("discovery_status") == "awaiting_confirmation" and not check["complete"]:
+        project["discovery_status"] = transition_discovery_status("awaiting_confirmation", "in_progress")
     await _save_discovery(project_id, user, project)
     return {"discovery_status": project["discovery_status"], "answers": answers, "completeness": check}
 
@@ -1006,7 +1250,8 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
         raise HTTPException(status_code=409, detail=f"Discovery belum siap dikonfirmasi (status: {status}). Lengkapi jawaban terlebih dahulu.")
     check = completeness_check(project)
     if not check["complete"]:
-        raise HTTPException(status_code=422, detail="Discovery belum lengkap: " + ", ".join(check["required_missing"] + check["unknown"]))
+        blockers = check["required_missing"] + check["conditional_missing"] + check["unknown"] + check["critical_ambiguities"]
+        raise HTTPException(status_code=422, detail="Discovery belum lengkap: " + ", ".join(blockers))
     merged = merge_discovery_answers(project)
     updates = {field: merged[field] for field in DISCOVERY_FIELD_MAP.values() if field in merged and merged.get(field)}
     spec = build_canonical_spec(merged)

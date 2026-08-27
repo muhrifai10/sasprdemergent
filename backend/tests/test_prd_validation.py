@@ -2291,6 +2291,7 @@ def test_d031_fallback_receives_same_context(monkeypatch):
     asyncio.run(server._ai_analyze_discovery({
         "description": "same context",
         "target_users": "operators",
+        "desired_features": "task tracking",
         "discovery": {"questions": [{"id": "q_old", "category": "target_users"}],
                       "answers": {"q_old": {"value": "operators", "status": "CONFIRMED"}}},
     }))
@@ -2299,7 +2300,7 @@ def test_d031_fallback_receives_same_context(monkeypatch):
 
 def test_d031_confirmed_answers_remain_unchanged(monkeypatch):
     valid = json.dumps(_analysis_json(questions=[{"question": "Payment?", "category": "payment_requirement"}]))
-    project = {"description": "idea", "target_users": "teams", "payment_requirement": "Midtrans", "discovery": {
+    project = {"description": "idea", "target_users": "teams", "desired_features": "task", "payment_requirement": "Midtrans", "discovery": {
         "questions": [{"id": "q_pay", "category": "payment_requirement"}],
         "answers": {"q_pay": {"value": "Midtrans", "status": "CONFIRMED"}},
     }}
@@ -2320,10 +2321,265 @@ def test_d031_zero_questions_with_high_impact_gap_retries(monkeypatch):
 def test_d031_zero_questions_allowed_when_complete(monkeypatch):
     complete = json.dumps(_analysis_json(missing=[], ambiguities=[]))
     _fake_discovery_stream(monkeypatch, [complete])
-    result = asyncio.run(server._ai_analyze_discovery({"description": "fully specified", "target_users": "teams", "discovery": {"questions": [], "answers": {}}}))
+    result = asyncio.run(server._ai_analyze_discovery({"description": "fully specified", "target_users": "teams", "desired_features": "task", "discovery": {"questions": [], "answers": {}}}))
     assert result.questions == []
 
 
 def test_d031_reasoning_content_never_becomes_discovery_data():
     message = SimpleNamespace(content=None, model_extra={"reasoning_content": "ask for the API key"})
     assert server._assistant_answer_content(message) == ""
+
+
+# ---------- D0.4: adaptive completeness + ambiguity engine ----------
+
+def _d04_project(**over):
+    p = {
+        "name": "Product",
+        "description": "A product for teams.",
+        "desired_features": "task management",
+        "target_users": "teams",
+        "discovery": {"questions": [], "answers": {}, "analysis": {}},
+    }
+    p.update(over)
+    return p
+
+
+def test_d04_product_missing_is_incomplete():
+    result = server.completeness_check(_d04_project(name="", description=""))
+    assert not result["complete"]
+    assert "product_identity" in result["required_missing"]
+
+
+def test_d04_target_users_missing_is_incomplete():
+    result = server.completeness_check(_d04_project(target_users=""))
+    assert not result["complete"]
+    assert "target_users" in result["required_missing"]
+
+
+def test_d04_core_functionality_missing_is_incomplete():
+    result = server.completeness_check(_d04_project(desired_features=""))
+    assert not result["complete"]
+    assert "core_functionality" in result["required_missing"]
+
+
+def test_d04_sufficient_product_user_features_is_ready():
+    result = server.completeness_check(_d04_project())
+    assert result["complete"]
+    assert result["readiness"] == "ready_for_review"
+
+
+def test_d04_critical_workflow_ambiguity_blocks():
+    result = server.completeness_check(_d04_project(discovery={"questions": [], "answers": [],
+                                                               "analysis": {"ambiguities": ["Task workflow and lifecycle are unclear"]}}))
+    assert not result["complete"]
+    assert result["critical_ambiguities"]
+    assert "workflow" in result["next_question_categories"]
+
+
+def test_d04_minor_ui_ambiguity_does_not_block():
+    result = server.completeness_check(_d04_project(discovery={"questions": [], "answers": [],
+                                                               "analysis": {"ambiguities": ["Bar chart color is undecided"]}}))
+    assert result["complete"]
+    assert result["minor_ambiguities"]
+
+
+def test_d04_critical_permission_ambiguity_blocks():
+    result = server.completeness_check(_d04_project(
+        target_users="admin and kasir",
+        discovery={"questions": [], "answers": [], "analysis": {"ambiguities": ["Permission boundaries are unclear"]}},
+    ))
+    assert not result["complete"]
+    assert any("permission" in item.lower() for item in result["critical_ambiguities"])
+
+
+def test_d04_payment_not_required_does_not_block():
+    result = server.completeness_check(_d04_project(product_type="E-Commerce", payment_requirement="Tidak"))
+    assert result["complete"]
+    assert result["category_status"]["payment"] == "NOT_REQUIRED"
+    assert "payment" not in result["conditional_missing"]
+
+
+def test_d04_payment_behavior_known_provider_optional():
+    result = server.completeness_check(_d04_project(product_type="E-Commerce", payment_requirement="required"))
+    assert result["complete"]
+    assert "payment" not in result["conditional_missing"]
+
+
+def test_d04_inventory_active_unknown_blocks():
+    result = server.completeness_check(_d04_project(description="A retail app with inventory and stock tracking."))
+    assert not result["complete"]
+    assert "inventory" in result["conditional_missing"]
+
+
+def test_d04_inventory_not_relevant_is_not_required():
+    result = server.completeness_check(_d04_project())
+    assert result["category_status"]["inventory"] == "NOT_REQUIRED"
+    assert "inventory" not in result["conditional_missing"]
+
+
+def test_d04_absent_integrations_do_not_block():
+    result = server.completeness_check(_d04_project(integrations=""))
+    assert result["complete"]
+    assert "integration" in result["optional_unknowns"]
+
+
+def test_d04_confirmed_counts_as_known():
+    result = server.completeness_check(_d04_project(
+        target_users="",
+        discovery={"questions": [{"id": "q_users", "category": "target_users"}],
+                    "answers": {"q_users": {"value": "operators", "status": "CONFIRMED"}}, "analysis": {}},
+    ))
+    assert result["category_status"]["target_users"] == "CONFIRMED"
+    assert "target_users" not in result["required_missing"]
+
+
+def test_d04_inferred_does_not_satisfy_critical_category():
+    result = server.completeness_check(_d04_project(
+        target_users="",
+        discovery={"questions": [{"id": "q_users", "category": "target_users"}],
+                    "answers": {"q_users": {"value": "operators", "status": "INFERRED"}}, "analysis": {}},
+    ))
+    assert result["category_status"]["target_users"] == "INFERRED"
+    assert "target_users" in result["required_missing"]
+
+
+def test_d04_unknown_critical_and_optional_semantics():
+    optional = server.completeness_check(_d04_project(
+        discovery={"questions": [{"id": "q_tech", "category": "preferred_technology"}],
+                    "answers": {"q_tech": {"value": "", "status": "UNKNOWN"}}, "analysis": {}},
+    ))
+    critical = server.completeness_check(_d04_project(
+        target_users="",
+        discovery={"questions": [{"id": "q_users", "category": "target_users"}],
+                    "answers": {"q_users": {"value": "", "status": "UNKNOWN"}}, "analysis": {}},
+    ))
+    assert optional["complete"]
+    assert critical["unknown"] == ["q_users"]
+    assert not critical["complete"]
+
+
+def test_d04_not_required_never_blocks():
+    result = server.completeness_check(_d04_project(
+        description="A retail app with inventory.",
+        discovery={"questions": [{"id": "q_inventory", "category": "inventory"}],
+                    "answers": {"q_inventory": {"value": "", "status": "NOT_REQUIRED"}}, "analysis": {}},
+    ))
+    assert result["category_status"]["inventory"] == "NOT_REQUIRED"
+    assert "inventory" not in result["conditional_missing"]
+
+
+def test_d04_pos_realistic_idea_is_incomplete():
+    result = server.completeness_check({
+        "name": "Kasirku", "description": "Saya ingin membuat aplikasi kasir untuk toko.",
+        "product_type": "POS", "discovery": {"questions": [], "answers": {}, "analysis": {}},
+    })
+    assert not result["complete"]
+    assert {"target_users", "core_functionality", "payment"}.issubset(
+        set(result["required_missing"] + result["conditional_missing"])
+    )
+
+
+def test_d04_pos_realistic_details_are_ready_when_roles_defined():
+    result = server.completeness_check({
+        "name": "Kasirku", "description": "A retail POS.", "product_type": "POS",
+        "target_users": "admin and kasir", "desired_features": "transactions and receipt printing",
+        "payment_requirement": "cash and QRIS", "inventory": "not required", "roles_permissions": "admin manages; kasir sells",
+        "discovery": {"questions": [], "answers": {}, "analysis": {}},
+    })
+    assert result["complete"]
+
+
+def test_d04_saas_realistic_idea_needs_questions():
+    result = server.completeness_check({
+        "name": "TeamFlow", "description": "SaaS project management for teams.", "product_type": "SaaS",
+        "discovery": {"questions": [], "answers": {}, "analysis": {}},
+    })
+    assert not result["complete"]
+    assert "target_users" in result["required_missing"]
+
+
+def test_d04_saas_realistic_scope_is_ready():
+    result = server.completeness_check({
+        "name": "TeamFlow", "description": "SaaS project management.", "product_type": "SaaS",
+        "target_users": "Project Manager and Team Members", "desired_features": "project, task, assignment, due date, progress dashboard",
+        "roles_permissions": "Project Manager manages projects; Team Members manage assigned tasks",
+        "workflow": "create project, assign task, update status, review progress",
+        "discovery": {"questions": [], "answers": {}, "analysis": {}},
+    })
+    assert result["complete"]
+
+
+def test_d04_ecommerce_payment_is_conditional():
+    result = server.completeness_check({
+        "name": "Shop", "description": "Sell physical products online.", "product_type": "E-Commerce",
+        "target_users": "customers", "desired_features": "catalog and checkout",
+        "discovery": {"questions": [], "answers": {}, "analysis": {}},
+    })
+    assert not result["complete"]
+    assert "payment" in result["conditional_missing"]
+
+
+def test_d04_ai_saas_scope_is_ready():
+    result = server.completeness_check({
+        "name": "DocuMind", "description": "AI SaaS for document analysis.", "product_type": "SaaS",
+        "target_users": "compliance teams", "desired_features": "upload, summarize, extract fields",
+        "ai_capability": "summarization and extraction", "storage": "document storage",
+        "discovery": {"questions": [], "answers": {}, "analysis": {}},
+    })
+    assert result["complete"]
+
+
+def test_d04_answered_question_not_returned_as_missing():
+    result = server.completeness_check(_d04_project(
+        discovery={"questions": [{"id": "q_users", "category": "target_users"}],
+                    "answers": {"q_users": {"value": "teams", "status": "CONFIRMED"}}, "analysis": {
+                        "missing_requirements": ["target user segment"]}},
+    ))
+    assert "target_users" not in result["required_missing"]
+    assert "target_users" not in result["next_question_categories"]
+
+
+def test_d04_duplicate_missing_signal_is_deduplicated():
+    result = server.completeness_check(_d04_project(
+        target_users="",
+        discovery={"questions": [], "answers": {}, "analysis": {
+            "missing_requirements": ["target user", "target users", "user segment"]}},
+    ))
+    assert result["next_question_categories"].count("target_users") == 1
+
+
+def test_d04_unknown_critical_field_returns_followup_signal():
+    result = server.completeness_check(_d04_project(
+        discovery={"questions": [{"id": "q_workflow", "category": "workflow"}],
+                    "answers": {"q_workflow": {"value": "", "status": "UNKNOWN"}}, "analysis": {
+                        "missing_requirements": ["task workflow"]}},
+    ))
+    assert not result["complete"]
+    assert "workflow" in result["next_question_categories"]
+
+
+def test_d04_complete_answers_transition_to_awaiting_confirmation(monkeypatch):
+    store = _seed(monkeypatch, {"p1": {"id": "p1", "user_id": "u1", "name": "X", "description": "idea",
+                                       "desired_features": "task", "target_users": "teams", "discovery_status": "in_progress",
+                                       "discovery": {"questions": [{"id": "q_users", "category": "target_users"}], "answers": {}}}})
+    body = server.DiscoveryAnswersRequest(answers={"q_users": server.DiscoveryAnswer(value="teams", status="CONFIRMED")})
+    result = asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    assert result["discovery_status"] == "awaiting_confirmation"
+    assert result["completeness"]["readiness"] == "ready_for_review"
+
+
+def test_d04_incomplete_answers_return_to_in_progress(monkeypatch):
+    store = _seed(monkeypatch, {"p1": {"id": "p1", "user_id": "u1", "name": "X", "description": "idea",
+                                       "desired_features": "task", "discovery_status": "awaiting_confirmation",
+                                       "discovery": {"questions": [{"id": "q_users", "category": "target_users"}], "answers": {}}}})
+    body = server.DiscoveryAnswersRequest(answers={"q_users": server.DiscoveryAnswer(value="", status="UNKNOWN")})
+    result = asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    assert result["discovery_status"] == "in_progress"
+    assert not result["completeness"]["complete"]
+
+
+def test_d04_never_sets_confirmed():
+    result = server.completeness_check(_d04_project())
+    assert result["readiness"] == "ready_for_review"
+    assert result["complete"]
+    assert "confirmed" not in result["readiness"]
