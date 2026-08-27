@@ -1729,3 +1729,239 @@ def test_d0_legacy_project_generates(monkeypatch):
     out = asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
     assert out["job_id"] == "JOB-1"
     assert calls
+
+
+# ---------- D0.2: discovery API + deterministic completeness + confirmation ----------
+
+def _mock_project_store(monkeypatch, projects):
+    store = {"projects": {pid: dict(p) for pid, p in projects.items()}}
+
+    class _Col:
+        async def find_one(self, q, *a, **k):
+            p = store["projects"].get(q.get("id"))
+            if p is None:
+                return None
+            if q.get("user_id") and p.get("user_id") != q["user_id"]:
+                return None
+            return p
+        async def update_one(self, q, update, *a, **k):
+            p = store["projects"].get(q.get("id"))
+            if p is None:
+                return None
+            for key, val in update.get("$set", {}).items():
+                p[key] = val
+            return None
+        async def count_documents(self, *a, **k):
+            return 0
+        async def insert_one(self, *a, **k):
+            return None
+
+    class _Db:
+        def __init__(self):
+            self.projects = _Col()
+    monkeypatch.setattr(server, "db", _Db())
+    return store
+
+
+def _seed(monkeypatch, projects):
+    return _mock_project_store(monkeypatch, projects)
+
+
+def _blank_project(**over):
+    p = {"id": "p1", "user_id": "u1", "name": "X", "description": "idea", "discovery_status": "none"}
+    p.update(over)
+    return p
+
+
+def test_d02_analyze_initializes(monkeypatch):
+    store = _seed(monkeypatch, {"p1": _blank_project()})
+    r = asyncio.run(server.discovery_analyze("p1", {"user_id": "u1"}))
+    assert r["discovery_status"] == "in_progress"
+    assert r["discovery"]["questions"] == server.DEFAULT_DISCOVERY_QUESTIONS
+    assert r["discovery"]["idea"] == "idea"
+
+
+def test_d02_analyze_idempotent(monkeypatch):
+    store = _seed(monkeypatch, {"p1": _blank_project()})
+    asyncio.run(server.discovery_analyze("p1", {"user_id": "u1"}))
+    asyncio.run(server.discovery_analyze("p1", {"user_id": "u1"}))
+    p = store["projects"]["p1"]
+    assert p["discovery_status"] == "in_progress"
+    assert len(p["discovery"]["questions"]) == len(server.DEFAULT_DISCOVERY_QUESTIONS)
+
+
+def test_d02_get_discovery(monkeypatch):
+    store = _seed(monkeypatch, {"p1": _blank_project()})
+    asyncio.run(server.discovery_analyze("p1", {"user_id": "u1"}))
+    r = asyncio.run(server.get_discovery("p1", {"user_id": "u1"}))
+    assert r["discovery_status"] == "in_progress"
+    assert r["discovery"]["questions"]
+
+
+def test_d02_answer_persists_idempotent(monkeypatch):
+    store = _seed(monkeypatch, {"p1": _blank_project()})
+    asyncio.run(server.discovery_analyze("p1", {"user_id": "u1"}))
+    body = server.DiscoveryAnswersRequest(answers={"q_core_features": server.DiscoveryAnswer(value="task mgmt", status="CONFIRMED")})
+    r1 = asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    assert r1["answers"]["q_core_features"]["value"] == "task mgmt"
+    r2 = asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    assert r2["answers"]["q_core_features"]["value"] == "task mgmt"
+    assert len(store["projects"]["p1"]["discovery"]["answers"]) == 1
+
+
+def test_d02_answer_invalid_question(monkeypatch):
+    store = _seed(monkeypatch, {"p1": _blank_project()})
+    asyncio.run(server.discovery_analyze("p1", {"user_id": "u1"}))
+    body = server.DiscoveryAnswersRequest(answers={"q_nope": server.DiscoveryAnswer(value="x")})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    assert e.value.status_code == 400
+
+
+def test_d02_cross_project_question_rejected(monkeypatch):
+    store = _seed(monkeypatch, {
+        "p1": {"id": "p1", "user_id": "u1", "name": "A", "discovery_status": "in_progress",
+               "discovery": {"questions": [{"id": "q_a", "category": "target_users"}]}},
+        "p2": {"id": "p2", "user_id": "u1", "name": "B", "discovery_status": "in_progress",
+               "discovery": {"questions": [{"id": "q_b", "category": "target_users"}]}},
+    })
+    body = server.DiscoveryAnswersRequest(answers={"q_b": server.DiscoveryAnswer(value="z")})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    assert e.value.status_code == 400
+
+
+def test_d02_completeness_missing_required():
+    p = {"name": "X", "description": "", "desired_features": "", "target_users": "", "discovery": {"questions": [], "answers": {}}}
+    r = server.completeness_check(p)
+    assert not r["complete"]
+    assert "core_functionality" in r["required_missing"]
+    assert "target_users" in r["required_missing"]
+
+
+def test_d02_completeness_sufficient():
+    p = {"name": "X", "description": "idea", "desired_features": "task", "target_users": "teams", "discovery": {"questions": [], "answers": {}}}
+    assert server.completeness_check(p)["complete"]
+
+
+def test_d02_completeness_conditional_payment_commerce():
+    p = {"name": "X", "product_type": "E-Commerce", "description": "jual produk", "desired_features": "checkout", "target_users": "customer", "discovery": {"questions": [], "answers": {}}}
+    r = server.completeness_check(p)
+    assert "payment" in r["conditional_missing"]
+
+
+def test_d02_completeness_no_payment_for_saas():
+    p = {"name": "X", "product_type": "SaaS", "description": "crm", "desired_features": "task", "target_users": "teams", "discovery": {"questions": [], "answers": {}}}
+    r = server.completeness_check(p)
+    assert "payment" not in r["conditional_missing"]
+    assert r["complete"]
+
+
+def test_d02_completeness_optional_technology():
+    p = {"name": "X", "description": "idea", "desired_features": "task", "target_users": "teams", "preferred_technology": "", "discovery": {"questions": [], "answers": {}}}
+    r = server.completeness_check(p)
+    assert r["complete"]
+    assert "technology_unspecified" in r["warnings"]
+
+
+def test_d02_completeness_unknown_blocks():
+    p = {"name": "X", "description": "idea", "desired_features": "task", "target_users": "teams",
+         "discovery": {"questions": [{"id": "q_t", "category": "target_users"}],
+                       "answers": {"q_t": {"value": "", "status": "UNKNOWN"}}}}
+    r = server.completeness_check(p)
+    assert "q_t" in r["unknown"]
+    assert not r["complete"]
+
+
+def test_d02_summary_states():
+    p = {"name": "X", "description": "idea", "target_users": "teams", "desired_features": "task",
+         "discovery": {"questions": [{"id": "q_t", "category": "target_users"}, {"id": "q_f", "category": "desired_features"},
+                                     {"id": "q_tech", "category": "preferred_technology"}, {"id": "q_pay", "category": "payment_requirement"}],
+                       "answers": {"q_t": {"value": "teams", "status": "CONFIRMED"},
+                                   "q_f": {"value": "task", "status": "INFERRED"},
+                                   "q_tech": {"value": "", "status": "UNKNOWN"},
+                                   "q_pay": {"value": "", "status": "NOT_REQUIRED"}}}}
+    s = server.build_discovery_summary(p)
+    assert s["fields"]["target_users"]["status"] == "CONFIRMED"
+    assert s["fields"]["desired_features"]["status"] == "INFERRED"
+    assert s["fields"]["preferred_technology"]["status"] == "UNKNOWN"
+    assert s["fields"]["payment_requirement"]["status"] == "NOT_REQUIRED"
+
+
+def _confirm_project(monkeypatch, **over):
+    p = {"id": "p1", "user_id": "u1", "name": "X", "description": "idea", "discovery_status": "awaiting_confirmation",
+         "desired_features": "task", "target_users": "teams",
+         "discovery": {"questions": server.DEFAULT_DISCOVERY_QUESTIONS, "answers": {}, "summary": {}, "confirmed_at": None}}
+    p.update(over)
+    return _seed(monkeypatch, {"p1": p})
+
+
+def test_d02_confirm_blocked_incomplete(monkeypatch):
+    _confirm_project(monkeypatch, target_users="")
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert e.value.status_code == 422
+
+
+def test_d02_confirm_blocked_unknown_ambiguity(monkeypatch):
+    _confirm_project(monkeypatch, discovery={"questions": server.DEFAULT_DISCOVERY_QUESTIONS,
+                                             "answers": {"q_target_users": {"value": "", "status": "UNKNOWN"}}, "summary": {}, "confirmed_at": None})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert e.value.status_code == 422
+
+
+def test_d02_confirm_succeeds_and_maps(monkeypatch):
+    store = _confirm_project(monkeypatch, discovery={"questions": server.DEFAULT_DISCOVERY_QUESTIONS,
+                                                     "answers": {"q_technology": {"value": "Next.js + PostgreSQL", "status": "CONFIRMED"}},
+                                                     "summary": {}, "confirmed_at": None})
+    r = asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert r["discovery_status"] == "confirmed"
+    assert r["confirmed_at"] is not None
+    p = store["projects"]["p1"]
+    assert p["discovery_status"] == "confirmed"
+    assert p["discovery"]["confirmed_at"] is not None
+    assert p["preferred_technology"] == "Next.js + PostgreSQL"
+
+
+def test_d02_confirm_does_not_start_generation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "start_generation_job", lambda *a, **k: calls.append(1) or "JOB")
+    _confirm_project(monkeypatch)
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert calls == []
+
+
+def test_d02_confirm_calls_build_canonical_spec(monkeypatch):
+    real = server.build_canonical_spec
+    called = []
+    monkeypatch.setattr(server, "build_canonical_spec", lambda p: called.append(1) or real(p))
+    _confirm_project(monkeypatch)
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert called
+
+
+def test_d02_confirm_validates_canonical_spec(monkeypatch):
+    _confirm_project(monkeypatch, payment_requirement="Stripe and Midtrans")
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert e.value.status_code == 422
+
+
+def test_d02_cross_workspace_rejected(monkeypatch):
+    _seed(monkeypatch, {"p1": {"id": "p1", "user_id": "u1", "name": "X", "discovery_status": "in_progress",
+                               "discovery": {"questions": server.DEFAULT_DISCOVERY_QUESTIONS, "answers": {}}}})
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.get_discovery("p1", {"user_id": "u2"}))
+    assert e.value.status_code == 404
+
+
+def test_d02_sensitive_answer_not_logged(monkeypatch):
+    logged = []
+    monkeypatch.setattr(server.logger, "info", lambda *a, **k: logged.append(a))
+    monkeypatch.setattr(server.logger, "warning", lambda *a, **k: logged.append(a))
+    _seed(monkeypatch, {"p1": {"id": "p1", "user_id": "u1", "name": "X", "discovery_status": "in_progress",
+                               "discovery": {"questions": server.DEFAULT_DISCOVERY_QUESTIONS, "answers": {}}}})
+    body = server.DiscoveryAnswersRequest(answers={"q_target_users": server.DiscoveryAnswer(value="SECRETVALUE", status="CONFIRMED")})
+    asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    assert not any("SECRETVALUE" in str(x) for x in logged)

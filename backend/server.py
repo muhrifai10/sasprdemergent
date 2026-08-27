@@ -562,6 +562,211 @@ def discovery_confirmed(project: dict) -> bool:
     return project.get("discovery_status", "confirmed") == "confirmed"
 
 
+# ---------- Discovery pipeline (D0.2, deterministic, no LLM) ----------
+# analyze -> answers -> completeness -> summary -> confirm -> map to project fields
+# -> build_canonical_spec. The existing PRD engine stays untouched downstream.
+# ponytail: plain dict + Pydantic, no new store, no hidden AI call.
+
+DISCOVERY_ANSWER_STATUSES = ("CONFIRMED", "INFERRED", "UNKNOWN", "NOT_REQUIRED")
+
+DISCOVERY_FIELD_MAP = {
+    "product_type": "product_type",
+    "target_users": "target_users",
+    "business_goal": "business_goal",
+    "desired_features": "desired_features",
+    "preferred_technology": "preferred_technology",
+    "auth_requirement": "auth_requirement",
+    "payment_requirement": "payment_requirement",
+    "integrations": "integrations",
+    "deployment_preference": "deployment_preference",
+}
+
+DEFAULT_DISCOVERY_QUESTIONS = [
+    {"id": "q_core_features", "question": "[PLACEHOLDER] Apa fitur inti produk ini?", "type": "text", "options": [],
+     "required": True, "category": "desired_features", "reason": "Core functionality is required to define the product.",
+     "impact": "core_functionality", "dependency": None, "placeholder": True},
+    {"id": "q_target_users", "question": "[PLACEHOLDER] Siapa target pengguna produk ini?", "type": "text", "options": [],
+     "required": True, "category": "target_users", "reason": "Target users are required to define roles and journeys.",
+     "impact": "target_users", "dependency": None, "placeholder": True},
+    {"id": "q_technology", "question": "[PLACEHOLDER] Teknologi yang diinginkan? (opsional)", "type": "text", "options": [],
+     "required": False, "category": "preferred_technology", "reason": "Optional; a safe default applies if unanswered.",
+     "impact": "technology", "dependency": None, "placeholder": True},
+    {"id": "q_payment", "question": "[PLACEHOLDER] Apakah produk membutuhkan pembayaran? (kondisional)", "type": "text", "options": [],
+     "required": False, "category": "payment_requirement", "reason": "Conditional; required only when the product involves payments.",
+     "impact": "payment", "dependency": None, "placeholder": True},
+]
+
+
+class DiscoveryAnswer(BaseModel):
+    value: str = ""
+    status: str = "CONFIRMED"
+
+
+class DiscoveryAnswersRequest(BaseModel):
+    answers: dict[str, DiscoveryAnswer]
+
+
+def _discovery(project: dict) -> dict:
+    disc = project.get("discovery") or {}
+    project["discovery"] = disc
+    return disc
+
+
+def _discovery_questions(project: dict) -> list:
+    return _discovery(project).get("questions") or []
+
+
+def _question_category(project: dict, qid: str) -> Optional[str]:
+    for q in _discovery_questions(project):
+        if q.get("id") == qid:
+            return q.get("category")
+    return None
+
+
+def merge_discovery_answers(project: dict) -> dict:
+    """Priority: CONFIRMED answer > existing project field > INFERRED answer. Never invents."""
+    merged = dict(project)
+    answers = _discovery(project).get("answers") or {}
+    for qid, ans in answers.items():
+        field = _question_category(project, qid)
+        if not field:
+            continue
+        status = ans.get("status", "CONFIRMED")
+        value = (ans.get("value") or "").strip()
+        if status == "CONFIRMED" and value:
+            merged[field] = ans["value"]
+        elif status == "INFERRED" and not merged.get(field):
+            merged[field] = ans["value"]
+    return merged
+
+
+def completeness_check(project: dict) -> dict:
+    """Deterministic minimum-information check (NOT "PRD complete")."""
+    merged = merge_discovery_answers(project)
+    domain = infer_domain(merged)
+    result = {"complete": True, "required_missing": [], "conditional_missing": [], "unknown": [], "warnings": []}
+    if not (merged.get("desired_features") or merged.get("description")):
+        result["required_missing"].append("core_functionality")
+    if not merged.get("target_users"):
+        result["required_missing"].append("target_users")
+    if domain == "commerce" and not merged.get("payment_requirement"):
+        result["conditional_missing"].append("payment")
+    if not merged.get("preferred_technology"):
+        result["warnings"].append("technology_unspecified")
+    if not merged.get("deployment_preference"):
+        result["warnings"].append("infrastructure_unspecified")
+    for qid, ans in (_discovery(project).get("answers") or {}).items():
+        if ans.get("status") == "UNKNOWN":
+            result["unknown"].append(qid)
+    result["complete"] = not result["required_missing"] and not result["unknown"]
+    return result
+
+
+def build_discovery_summary(project: dict) -> dict:
+    merged = merge_discovery_answers(project)
+    answers = _discovery(project).get("answers") or {}
+
+    def field_state(field: str) -> dict:
+        for qid, ans in answers.items():
+            if _question_category(project, qid) == field:
+                return {"value": ans.get("value") or "", "status": ans.get("status", "CONFIRMED")}
+        val = merged.get(field) or ""
+        return {"value": val, "status": "CONFIRMED" if val else "UNKNOWN"}
+
+    return {
+        "product": merged.get("name") or "",
+        "purpose": merged.get("business_goal") or merged.get("description") or "",
+        "fields": {f: field_state(f) for f in (
+            "target_users", "desired_features", "preferred_technology",
+            "payment_requirement", "auth_requirement", "integrations")},
+        "unresolved": [qid for qid, ans in answers.items() if ans.get("status") == "UNKNOWN"],
+    }
+
+
+async def _load_owned_project(project_id: str, user: dict) -> dict:
+    p = await db.projects.find_one({"id": project_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return p
+
+
+async def _save_discovery(project_id: str, user: dict, project: dict) -> None:
+    await db.projects.update_one(
+        {"id": project_id, "user_id": user["user_id"]},
+        {"$set": {"discovery_status": project.get("discovery_status"), "discovery": _discovery(project)}},
+    )
+
+
+@api_router.post("/projects/{project_id}/discovery/analyze")
+async def discovery_analyze(project_id: str, user: dict = Depends(get_current_user)):
+    project = await _load_owned_project(project_id, user)
+    if project.get("discovery_status") in (None, "none"):
+        project["discovery_status"] = transition_discovery_status("none", "in_progress")
+    disc = _discovery(project)
+    if not disc.get("questions"):
+        disc["questions"] = DEFAULT_DISCOVERY_QUESTIONS
+    disc.setdefault("idea", project.get("description", ""))
+    disc.setdefault("answers", {})
+    disc.setdefault("summary", {})
+    disc.setdefault("confirmed_at", None)
+    await _save_discovery(project_id, user, project)
+    return {"discovery_status": project["discovery_status"], "discovery": disc}
+
+
+@api_router.get("/projects/{project_id}/discovery")
+async def get_discovery(project_id: str, user: dict = Depends(get_current_user)):
+    project = await _load_owned_project(project_id, user)
+    return {"discovery_status": project.get("discovery_status"), "discovery": _discovery(project)}
+
+
+@api_router.post("/projects/{project_id}/discovery/answers")
+async def discovery_answers(project_id: str, body: DiscoveryAnswersRequest, user: dict = Depends(get_current_user)):
+    project = await _load_owned_project(project_id, user)
+    if project.get("discovery_status") in (None, "none"):
+        raise HTTPException(status_code=409, detail="Discovery belum dimulai. Jalankan analyze terlebih dahulu.")
+    disc = _discovery(project)
+    qids = {q.get("id") for q in _discovery_questions(project)}
+    answers = dict(disc.get("answers") or {})
+    for qid, ans in body.answers.items():
+        if qid not in qids:
+            raise HTTPException(status_code=400, detail=f"question_id tidak dikenal: {qid}")
+        if ans.status not in DISCOVERY_ANSWER_STATUSES:
+            raise HTTPException(status_code=400, detail=f"Status jawaban tidak valid: {ans.status}")
+        answers[qid] = {"value": ans.value, "status": ans.status}
+    disc["answers"] = answers
+    check = completeness_check(project)
+    if project.get("discovery_status") == "in_progress" and check["complete"]:
+        project["discovery_status"] = transition_discovery_status("in_progress", "awaiting_confirmation")
+    await _save_discovery(project_id, user, project)
+    return {"discovery_status": project["discovery_status"], "answers": answers, "completeness": check}
+
+
+@api_router.post("/projects/{project_id}/discovery/confirm")
+async def discovery_confirm(project_id: str, user: dict = Depends(get_current_user)):
+    project = await _load_owned_project(project_id, user)
+    status = project.get("discovery_status")
+    if status == "confirmed":
+        return {"discovery_status": "confirmed", "confirmed_at": _discovery(project).get("confirmed_at")}
+    if status != "awaiting_confirmation":
+        raise HTTPException(status_code=409, detail=f"Discovery belum siap dikonfirmasi (status: {status}). Lengkapi jawaban terlebih dahulu.")
+    check = completeness_check(project)
+    if not check["complete"]:
+        raise HTTPException(status_code=422, detail="Discovery belum lengkap: " + ", ".join(check["required_missing"] + check["unknown"]))
+    merged = merge_discovery_answers(project)
+    updates = {field: merged[field] for field in DISCOVERY_FIELD_MAP.values() if field in merged and merged.get(field)}
+    spec = build_canonical_spec(merged)
+    issues = validate_canonical_spec(spec)
+    if issues:
+        raise HTTPException(status_code=422, detail="Canonical spec invalid: " + "; ".join(issues))
+    disc = _discovery(project)
+    disc["confirmed_at"] = datetime.now(timezone.utc).isoformat()
+    disc["summary"] = build_discovery_summary(project)
+    updates["discovery_status"] = "confirmed"
+    updates["discovery"] = disc
+    await db.projects.update_one({"id": project_id, "user_id": user["user_id"]}, {"$set": updates})
+    return {"discovery_status": "confirmed", "confirmed_at": disc["confirmed_at"], "summary": disc["summary"]}
+
+
 @api_router.post("/projects")
 async def create_project(body: ProjectCreate, user: dict = Depends(get_current_user)):
     plan = PLANS.get(user.get("plan", "free"), PLANS["free"])
