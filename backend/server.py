@@ -1216,6 +1216,180 @@ async def stream_openai_compatible(provider: str, api_key: str, base_url: str, m
             yield response.choices[0].message.content
 
 
+# ---------- Phase 4: automatic conflict repair ----------
+# Targeted, section-scoped repair: rebuild only conflicting sections against the
+# CanonicalProductSpec (single source of truth). Never regenerates the whole PRD,
+# never changes canonical decisions, never invents features. Bounded attempts.
+# ponytail: reuse analyze's severity model; conflicts are a small typed model, no
+# new framework.
+
+
+class Conflict(BaseModel):
+    kind: str
+    severity: str = "high"
+    section: int
+    expected: str
+    actual: str
+    rule: str
+    evidence: str
+    repairable: bool = True
+
+
+REPAIR_SYSTEM = """You fix specific inconsistencies in a PRD section. You are given a FROZEN canonical
+spec (the single source of truth) and a list of paragraph-level conflicts in one or more
+sections. Rewrite ONLY the affected section bodies to match the canonical spec.
+Rules: keep every unchanged part identical; do NOT add new features; do NOT change scope,
+goals, or the canonical decisions; do NOT introduce any provider/technology/database other
+than the canonical one. Return only the fixed sections, each with its exact `## N.` heading."""
+
+_PAY_FAM = {"midtrans": ("midtrans",), "stripe": ("stripe",), "xendit": ("xendit",), "paypal": ("paypal",)}
+_STOR_FAM = {"aws s3": ("s3", "amazon s3"), "cloudinary": ("cloudinary",),
+             "supabase storage": ("supabase storage",), "firebase storage": ("firebase storage",)}
+_INFRA_FAM = {"aws ecs": ("ecs", "amazon ecs"), "vercel": ("vercel",), "heroku": ("heroku",),
+              "fly.io": ("fly.io",), "render": ("render",), "digitalocean": ("digitalocean",)}
+_COMMERCE_LEAK = ("shipped", "delivered", "inventory", "stock", "checkout")
+_MAX_REPAIR_ATTEMPTS = 2
+
+# Explicit framework contradictions (safe: complements like React-in-Next are NOT listed).
+_TECH_CONFLICTS = {
+    "next.js": ("laravel", "django", "flask", "express", "rails"),
+    "laravel": ("django", "fastapi", "flask", "spring", "express", "next.js"),
+    "django": ("laravel", "spring", "express"),
+    "react": ("vue", "svelte"),
+}
+_AI_CORE_RE = re.compile(r"\b(generate|generation|ai|prd)\b", re.IGNORECASE)
+_NONGOAL_AI_RE = re.compile(r"\b(out of scope|di luar|non-goal|bukan prioritas)\b[^.\n]{0,90}\b(generat|ai|prd)\b", re.IGNORECASE)
+
+
+def _families_for(canonical: str, fams: dict) -> set:
+    return {name for name in fams if name.lower() in canonical.lower()}
+
+
+def canonical_violations(content: str, spec: CanonicalProductSpec) -> list[Conflict]:
+    bodies = parse_section_bodies(content)
+    issues: list[Conflict] = []
+    for idx, body in bodies.items():
+        low = body.lower()
+        if any(t in low for t in _COMMERCE_LEAK) and spec.domain != "commerce":
+            issues.append(Conflict(
+                kind="commerce_leak", severity="high", section=idx, expected="no commerce scope",
+                actual="/".join(t for t in _COMMERCE_LEAK if t in low),
+                rule="Non-commerce project uses commerce vocabulary",
+                evidence="falling outside the canonical scope"))
+        if spec.payments:
+            allow = _families_for(spec.payments, _PAY_FAM)
+            for name, terms in _PAY_FAM.items():
+                if name in allow or any(t in spec.payments.lower() for t in terms):
+                    continue
+                if any(t in low for t in terms):
+                    issues.append(Conflict(
+                        kind="payment", severity="high", section=idx, expected=spec.payments, actual=name,
+                        rule="Section uses a payment provider different from the canonical decision",
+                        evidence="payment provider mismatch"))
+        if spec.storage:
+            allow = _families_for(spec.storage, _STOR_FAM)
+            for name, terms in _STOR_FAM.items():
+                if name in allow:
+                    continue
+                if any(t in low for t in terms):
+                    issues.append(Conflict(
+                        kind="storage", severity="high", section=idx, expected=spec.storage, actual=name,
+                        rule="Section uses storage different from the canonical decision",
+                        evidence="storage decision mismatch"))
+        if spec.infrastructure:
+            allow = _families_for(spec.infrastructure, _INFRA_FAM)
+            for name, terms in _INFRA_FAM.items():
+                if name in allow:
+                    continue
+                if any(t in low for t in terms):
+                    issues.append(Conflict(
+                        kind="infrastructure", severity="high", section=idx, expected=spec.infrastructure, actual=name,
+                        rule="Section uses a backend/hosting provider different from the canonical decision",
+                        evidence="infrastructure decision mismatch"))
+        if spec.technology:
+            canon_low = spec.technology.lower()
+            for frame, alts in _TECH_CONFLICTS.items():
+                if frame in canon_low:
+                    for alt in alts:
+                        if re.search(rf"\b{re.escape(alt)}\b", low):
+                            issues.append(Conflict(
+                                kind="technology", severity="high", section=idx, expected=spec.technology, actual=alt,
+                                rule="Section uses a competing framework different from the canonical technology",
+                                evidence="framework mismatch"))
+                            break
+        if idx == 1 and _AI_CORE_RE.search(spec.features) and _NONGOAL_AI_RE.search(low):
+            issues.append(Conflict(
+                kind="ai_nongoals", severity="high", section=1, expected="AI generation is a core feature",
+                actual="AI generation declared out of scope",
+                rule="Non-Goals excludes a feature the user explicitly requested",
+                evidence="Non-Goals contradicts scope"))
+    return issues
+
+
+def _set_section_body(content: str, idx: int, new_body: str) -> str:
+    marker = re.compile(rf"^##\s+{idx + 1}\.\s+.*$", re.MULTILINE)
+    m = marker.search(content)
+    if not m:
+        return content
+    start = m.end()
+    nxt = re.search(r"^##\s+\d+\.\s+.*$", content[start:], re.MULTILINE)
+    end = start + (nxt.start() if nxt else len(content) - start)
+    return content[:start] + "\n\n" + new_body.strip() + "\n" + content[end:]
+
+
+def _repair_prompt(spec: CanonicalProductSpec, sections: dict, violations: list[Conflict]) -> str:
+    lines = [
+        "FROZEN CANONICAL SPEC (single source of truth — do NOT change, do NOT pick alternatives):",
+        render_canonical_spec(spec),
+        "",
+        "CONFLICTS TO FIX:",
+    ]
+    for v in violations:
+        lines.append(f"- {v.rule} (section {v.section + 1}): expected {v.expected!r}, found {v.actual!r}")
+    lines.append("")
+    lines.append("SECTIONS TO FIX (rewrite each body only; keep the exact heading):")
+    for idx in sorted(sections):
+        heading = REQUIRED_PRD_HEADINGS[idx] if idx < len(REQUIRED_PRD_HEADINGS) else f"section {idx + 1}"
+        lines.append(f"{heading}\n{sections[idx]}\n")
+    return "\n".join(lines)
+
+
+async def repair_prd(content: str, project: dict, provider: str, api_key: str, base_url: str, model: str, language: str, max_attempts: int = _MAX_REPAIR_ATTEMPTS):
+    spec = build_canonical_spec(project)
+    diagnostics = {"attempts": 0, "repaired_sections": [], "unresolved": []}
+    for _attempt in range(max_attempts):
+        violations = [v for v in canonical_violations(content, spec) if v.repairable and v.severity in {"critical", "high"}]
+        if not violations:
+            break
+        section_ids = sorted({v.section for v in violations})
+        bodies = parse_section_bodies(content)
+        sections = {i: bodies[i] for i in section_ids if i in bodies}
+        prompt = _repair_prompt(spec, sections, violations)
+        repaired = ""
+        try:
+            async for delta in stream_openai_compatible(provider, api_key, base_url, model, REPAIR_SYSTEM, prompt, max_output_tokens=4000):
+                repaired += delta
+        except Exception as error:  # noqa: BLE001 - repair failure falls back to the already-valid content
+            logger.warning("repair failed: %s", error)
+            break
+        repaired_bodies = parse_section_bodies(repaired)
+        for idx in section_ids:
+            if idx in repaired_bodies:
+                content = _set_section_body(content, idx, repaired_bodies[idx])
+                diagnostics["repaired_sections"].append(idx)
+        diagnostics["attempts"] = _attempt + 1
+    diagnostics["unresolved"] = [v.model_dump() for v in canonical_violations(content, spec)]
+    return content, diagnostics
+
+
+async def run_repair_if_needed(content: str, project: dict, provider: str, api_key: str, base_url: str, model: str, language: str):
+    spec = build_canonical_spec(project)
+    violations = canonical_violations(content, spec)
+    if not violations:
+        return content, {"attempts": 0, "repaired_sections": [], "unresolved": []}
+    return await repair_prd(content, project, provider, api_key, base_url, model, language)
+
+
 # ---------- Dependency-aware section context ----------
 # Each chunk is generated against a *structured summary* of the earlier sections
 # it depends on, not the full raw text. This keeps later sections (data model,
@@ -1494,6 +1668,13 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
             content = strip_prd_contract_markers(content)
             validate_prd_consistency(content)
             report = analyze_prd_consistency(content)
+            content, repair_diag = await run_repair_if_needed(content, project, provider_used, api_key, base_url, model_used, language)
+            if repair_diag.get("attempts"):
+                validate_prd_consistency(content)
+                report = analyze_prd_consistency(content)
+            if repair_diag.get("unresolved"):
+                report["unresolved"] = repair_diag["unresolved"]
+            report["repair"] = repair_diag
             job["report"] = report
             job["content"] = content
         now = datetime.now(timezone.utc).isoformat()

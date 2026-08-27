@@ -1250,3 +1250,121 @@ def test_phase3_regression_payment_and_storage_preserved():
     assert "Payment (frozen): Midtrans" in prompt
     # Canonical anti-mix rule guards against Stripe; no Stripe-only section invented.
     assert "Stripe and Midtrans" in prompt
+
+
+# ---------- Phase 4: automatic conflict repair loop ----------
+
+def _prd(bodies):
+    out = ["# Product Requirements Document"]
+    for i, h in enumerate(REQUIRED_PRD_HEADINGS):
+        out.append(h)
+        out.append(bodies.get(i, ""))
+        out.append("")
+    return "\n".join(out)
+
+
+def _fake_stream_fix(repaired_text):
+    async def fake(provider, api_key, base_url, model, system_msg, user_msg, max_output_tokens=None):
+        yield repaired_text
+    return fake
+
+
+def test_conflict_detected_payment():
+    p = {"name": "Toko", "product_type": "E-Commerce", "payment_requirement": "Midtrans"}
+    spec = server.build_canonical_spec(p)
+    content = _prd({8: "Payment via Stripe gateway with webhook."})
+    vs = server.canonical_violations(content, spec)
+    assert any(v.kind == "payment" and v.actual == "stripe" for v in vs)
+
+
+def test_repairable_conflict_triggers_repair(monkeypatch):
+    p = {"name": "Toko", "product_type": "E-Commerce", "payment_requirement": "Midtrans"}
+    content = _prd({8: "Payment via Stripe gateway."})
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 9. Integrations, Payments, and Notifications\n\nPayment via Midtrans Snap.\n"))
+    out, diag = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    assert "Midtrans" in out and "Stripe" not in out
+    assert diag["attempts"] >= 1
+    assert diag["repaired_sections"] == [8]
+    assert not any(v["kind"] == "payment" for v in diag["unresolved"])
+
+
+def test_repair_only_touches_affected_section(monkeypatch):
+    p = {"name": "Toko", "product_type": "E-Commerce", "payment_requirement": "Midtrans"}
+    content = _prd({3: "FR-1 User create order.", 5: "orders (id, user_id, status).", 8: "Payment via Stripe."})
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 9. Integrations, Payments, and Notifications\n\nPayment via Midtrans.\n"))
+    out, _ = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    assert "FR-1 User create order." in out          # unchanged
+    assert "orders (id, user_id, status)." in out     # unchanged
+    assert "Midtrans" in out and "Stripe" not in out
+
+
+def test_canonical_spec_unchanged_during_repair(monkeypatch):
+    p = {"name": "Toko", "product_type": "E-Commerce", "payment_requirement": "Midtrans"}
+    before = server.build_canonical_spec(p).model_dump()
+    content = _prd({8: "Payment via Stripe."})
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 9. Integrations, Payments, and Notifications\n\nPayment via Midtrans.\n"))
+    asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    after = server.build_canonical_spec(p).model_dump()
+    assert before == after
+
+
+def test_technology_conflict_repaired(monkeypatch):
+    p = {"name": "X", "preferred_technology": "Next.js + PostgreSQL"}
+    content = _prd({9: "Built with Laravel + MySQL."})
+    assert any(v.kind == "technology" for v in server.canonical_violations(content, server.build_canonical_spec(p)))
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 10. Tech Stack and System Architecture\n\nBuilt with Next.js + PostgreSQL.\n"))
+    out, diag = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    assert "Next.js" in out and "Laravel" not in out
+    assert not any(v["kind"] == "technology" for v in diag["unresolved"])
+
+
+def test_storage_conflict_repaired(monkeypatch):
+    p = {"name": "X", "integrations": "S3"}
+    spec = server.build_canonical_spec(p)
+    assert spec.storage == "AWS S3"
+    content = _prd({8: "Store images in Cloudinary."})
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 9. Integrations, Payments, and Notifications\n\nStore images in AWS S3.\n"))
+    out, diag = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    assert "AWS S3" in out and "Cloudinary" not in out
+    assert not any(v["kind"] == "storage" for v in diag["unresolved"])
+
+
+def test_non_commerce_leakage_repaired(monkeypatch):
+    p = {"name": "SaaS", "product_type": "SaaS", "description": "CRM"}
+    content = _prd({5: "orders status shipped delivered inventory stock."})
+    assert any(v.kind == "commerce_leak" for v in server.canonical_violations(content, server.build_canonical_spec(p)))
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 6. Data Model and Database Schema\n\naccounts (id, status).\n"))
+    out, diag = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    assert "shipped" not in out.lower() and "delivered" not in out.lower()
+    assert not any(v["kind"] == "commerce_leak" for v in diag["unresolved"])
+
+
+def test_max_retry_marks_unresolved(monkeypatch):
+    p = {"name": "Toko", "product_type": "E-Commerce", "payment_requirement": "Midtrans"}
+    content = _prd({8: "Payment via Stripe gateway."})
+    monkeypatch.setattr(server, "stream_openai_compatible",
+                        _fake_stream_fix("## 9. Integrations, Payments, and Notifications\n\nPayment via Stripe again.\n"))
+    out, diag = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id", max_attempts=2))
+    assert diag["attempts"] == 2
+    assert any(v["kind"] == "payment" for v in diag["unresolved"])
+
+
+def test_valid_content_no_repair(monkeypatch):
+    p = {"name": "Toko", "product_type": "E-Commerce", "payment_requirement": "Midtrans"}
+    content = _prd({8: "Payment via Midtrans Snap gateway."})
+    called = []
+
+    async def fake(*a, **k):
+        called.append(1)
+        yield ""
+
+    monkeypatch.setattr(server, "stream_openai_compatible", fake)
+    out, diag = asyncio.run(server.repair_prd(content, p, "9router", "k", "u", "m", "id"))
+    assert diag["attempts"] == 0
+    assert not called
