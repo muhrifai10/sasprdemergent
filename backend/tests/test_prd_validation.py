@@ -1688,7 +1688,7 @@ def test_d0_transition_awaiting_to_confirmed():
 
 
 def test_d0_invalid_transition_rejected():
-    for cur, new in (("none", "confirmed"), ("confirmed", "in_progress"), ("in_progress", "confirmed"), ("none", "unknown")):
+    for cur, new in (("none", "confirmed"), ("in_progress", "confirmed"), ("none", "unknown")):
         with pytest.raises(ValueError):
             server.transition_discovery_status(cur, new)
 
@@ -2583,3 +2583,172 @@ def test_d04_never_sets_confirmed():
     assert result["readiness"] == "ready_for_review"
     assert result["complete"]
     assert "confirmed" not in result["readiness"]
+
+
+# ---------- D0.5: Product Understanding Review + confirmation ----------
+
+def _d05_project(**over):
+    p = {
+        "id": "p1", "user_id": "u1", "name": "TeamFlow", "description": "Project management for teams.",
+        "target_users": "teams", "desired_features": "projects and tasks", "discovery_status": "awaiting_confirmation",
+        "discovery": {"questions": [], "answers": {}, "analysis": {}},
+    }
+    p.update(over)
+    return p
+
+
+def test_d05_review_unavailable_before_discovery(monkeypatch):
+    _seed(monkeypatch, {"p1": _d05_project(discovery_status="none")})
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.discovery_review("p1", {"user_id": "u1"}))
+    assert error.value.status_code == 409
+
+
+def test_d05_review_contains_structured_summary_after_completeness(monkeypatch):
+    _seed(monkeypatch, {"p1": _d05_project()})
+    review = asyncio.run(server.discovery_review("p1", {"user_id": "u1"}))
+    assert review["readiness"] == "ready_for_review"
+    assert set(("summary", "decisions", "features", "roles", "workflows", "scope", "unknowns", "inferences", "non_goals", "readiness", "confirmation_state")).issubset(review["review"])
+    assert review["can_edit"] is True
+
+
+def test_d05_review_preserves_confirmed_inferred_unknown_and_not_required_sources(monkeypatch):
+    p = _d05_project(
+        target_users="",
+        non_goals="No marketplace or shipping.",
+        discovery={
+            "questions": [
+                {"id": "q_users", "category": "target_users"},
+                {"id": "q_roles", "category": "roles_permissions"},
+                {"id": "q_tech", "category": "preferred_technology"},
+                {"id": "q_inventory", "category": "inventory"},
+            ],
+            "answers": {
+                "q_users": {"value": "teams", "status": "CONFIRMED"},
+                "q_roles": {"value": "manager and member", "status": "INFERRED"},
+                "q_tech": {"value": "", "status": "UNKNOWN"},
+                "q_inventory": {"value": "", "status": "NOT_REQUIRED"},
+            },
+            "analysis": {},
+        },
+    )
+    _seed(monkeypatch, {"p1": p})
+    review = asyncio.run(server.discovery_review("p1", {"user_id": "u1"}))
+    assert review["product_understanding"]["decisions"]["target_users"]["source_id"] == "q_users"
+    assert any(item["key"] == "roles" and item["source"] == "INFERENCE" for item in review["inferred_items"])
+    assert any(item["key"] == "technology" and item["source"] == "UNKNOWN" for item in review["unknown_items"])
+    assert any(item["key"] == "inventory" and item["source"] == "DISCOVERY_ANSWER" for item in review["not_required_items"])
+    assert "roles" not in review["review"]["decisions"]
+
+
+def test_d05_explicit_non_goal_is_visible_in_scope(monkeypatch):
+    _seed(monkeypatch, {"p1": _d05_project(non_goals="No marketplace or shipping.")})
+    review = asyncio.run(server.discovery_review("p1", {"user_id": "u1"}))
+    assert any(item["key"] == "non_goals" for item in review["review"]["scope"]["out_of_scope"])
+
+
+def test_d05_ai_capability_is_separate_from_unknown_technology(monkeypatch):
+    _seed(monkeypatch, {"p1": _d05_project(
+        product_type="AI SaaS", ai_capability="summarization and extraction", preferred_technology="",
+    )})
+    review = asyncio.run(server.discovery_review("p1", {"user_id": "u1"}))
+    assert review["review"]["decisions"]["ai_capability"]["value"] == "summarization and extraction"
+    assert review["review"]["summary"]["technology"]["status"] == "UNKNOWN"
+
+
+def test_d05_confirm_blocked_when_incomplete(monkeypatch):
+    _confirm_project(monkeypatch, target_users="")
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert error.value.status_code == 422
+
+
+def test_d05_confirm_blocked_by_critical_ambiguity(monkeypatch):
+    _confirm_project(monkeypatch, discovery={"questions": server.DEFAULT_DISCOVERY_QUESTIONS, "answers": {}, "summary": {},
+                                              "analysis": {"ambiguities": ["Critical workflow is unclear"]}})
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert error.value.status_code == 422
+
+
+def test_d05_confirm_creates_snapshot_without_starting_generation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "start_generation_job", lambda *a, **k: calls.append(1))
+    store = _confirm_project(monkeypatch)
+    result = asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    p = store["projects"]["p1"]
+    snapshot = p["discovery"]["confirmation_snapshot"]
+    assert result["discovery_status"] == "confirmed"
+    assert p["discovery_status"] == "confirmed"
+    assert p["discovery"]["confirmed_at"]
+    assert snapshot["status"] == "confirmed"
+    assert snapshot["confirmed_at"] == p["discovery"]["confirmed_at"]
+    assert snapshot["completeness"]["complete"] is True
+    assert p["discovery"]["confirmation_snapshots"] == [snapshot]
+    assert calls == []
+
+
+def test_d05_confirm_does_not_call_ai_provider(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server, "stream_openai_compatible", lambda *a, **k: calls.append(1))
+    _confirm_project(monkeypatch)
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert calls == []
+
+
+def test_d05_confirmation_snapshot_redacts_secret_answers(monkeypatch):
+    secret_question = {"id": "q_secret", "question": "API key?", "category": "integrations"}
+    p = _confirm_project(monkeypatch, discovery={"questions": server.DEFAULT_DISCOVERY_QUESTIONS + [secret_question],
+                                                 "answers": {"q_secret": {"value": "sk-secret", "status": "CONFIRMED"}},
+                                                 "summary": {}, "confirmed_at": None})
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    snapshot = p["projects"]["p1"]["discovery"]["confirmation_snapshot"]
+    assert snapshot["answers"]["q_secret"]["value"] == "[REDACTED]"
+    assert all("sk-secret" not in str(value) for value in snapshot.values())
+
+
+def test_d05_material_answer_edit_invalidates_confirmation(monkeypatch):
+    store = _confirm_project(monkeypatch)
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    old_snapshot = store["projects"]["p1"]["discovery"]["confirmation_snapshot"]
+    body = server.DiscoveryAnswersRequest(answers={"q_target_users": server.DiscoveryAnswer(value="cashiers", status="CONFIRMED")})
+    result = asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    current = store["projects"]["p1"]
+    assert result["discovery_status"] == "in_progress"
+    assert current["discovery"]["confirmed_at"] is None
+    assert current["discovery"]["summary"] == {}
+    assert current["discovery"]["confirmation_snapshot"] == old_snapshot
+    assert result["completeness"]["complete"] is True
+
+
+def test_d05_reconfirm_after_edit_creates_new_snapshot(monkeypatch):
+    store = _confirm_project(monkeypatch)
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    body = server.DiscoveryAnswersRequest(answers={"q_target_users": server.DiscoveryAnswer(value="cashiers", status="CONFIRMED")})
+    asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    ready = asyncio.run(server.discovery_answers("p1", body, {"user_id": "u1"}))
+    assert ready["discovery_status"] == "awaiting_confirmation"
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert store["projects"]["p1"]["discovery_status"] == "confirmed"
+    assert len(store["projects"]["p1"]["discovery"]["confirmation_snapshots"]) == 2
+
+
+def test_d05_review_after_confirmation_exposes_frozen_state(monkeypatch):
+    store = _confirm_project(monkeypatch)
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    review = asyncio.run(server.discovery_review("p1", {"user_id": "u1"}))
+    assert review["review"]["confirmation_state"]["status"] == "confirmed"
+    assert review["review"]["confirmation_state"]["snapshot_available"] is True
+    assert review["can_confirm"] is False
+
+
+def test_d05_unauthorized_review_edit_and_confirmation_rejected(monkeypatch):
+    _confirm_project(monkeypatch)
+    for operation in (
+        lambda: server.discovery_review("p1", {"user_id": "u2"}),
+        lambda: server.discovery_answers("p1", server.DiscoveryAnswersRequest(answers={}), {"user_id": "u2"}),
+        lambda: server.discovery_confirm("p1", {"user_id": "u2"}),
+    ):
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(operation())
+        assert error.value.status_code == 404

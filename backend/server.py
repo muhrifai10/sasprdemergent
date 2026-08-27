@@ -6,6 +6,7 @@ import re
 import json
 import hashlib
 import hmac
+from copy import deepcopy
 from base64 import urlsafe_b64encode
 from collections import Counter
 from pathlib import Path
@@ -548,7 +549,7 @@ _DISCOVERY_TRANSITIONS = {
     "none": {"in_progress"},
     "in_progress": {"awaiting_confirmation", "none"},
     "awaiting_confirmation": {"confirmed", "in_progress"},
-    "confirmed": set(),
+    "confirmed": {"in_progress"},
 }
 
 
@@ -1173,6 +1174,155 @@ def build_discovery_summary(project: dict) -> dict:
     }
 
 
+# ---------- D0.5: Product Understanding Review ----------
+# The review is a structured projection of user input + discovery state. It is not
+# a canonical spec and it never promotes inference to a user decision.
+_REVIEW_FIELDS = (
+    ("product", "product_identity", "name"),
+    ("product_type", "product_type", "product_type"),
+    ("purpose", "purpose", "description"),
+    ("target_users", "target_users", "target_users"),
+    ("core_features", "core_functionality", "desired_features"),
+    ("roles", "roles_permissions", "roles_permissions"),
+    ("workflows", "workflow", "workflow"),
+    ("business_rules", "business_rules", "business_rules"),
+    ("authentication", "authentication", "auth_requirement"),
+    ("payment", "payment", "payment_requirement"),
+    ("inventory", "inventory", "inventory"),
+    ("integrations", "integration", "integrations"),
+    ("storage", "storage", "storage"),
+    ("technology", "technology", "preferred_technology"),
+    ("infrastructure", "deployment", "deployment_preference"),
+    ("ai_capability", "ai_capability", "ai_capability"),
+    ("document_input", "document_input", "document_input"),
+    ("constraints", "constraints", "constraints"),
+    ("non_goals", "non_goals", "non_goals"),
+)
+
+
+def _review_item(project: dict, key: str, category: str, field: str, completeness: dict) -> dict:
+    answers = _discovery(project).get("answers") or {}
+    question_category = _D04_QUESTION_CATEGORIES.get(category, category)
+    for question in reversed(_discovery_questions(project)):
+        if question.get("category") != question_category:
+            continue
+        answer = answers.get(question.get("id")) or {}
+        status = answer.get("status")
+        value = str(answer.get("value") or "").strip()
+        if any(term in str(question.get("question") or "").lower() for term in _SECRET_TERMS):
+            value = "[REDACTED]" if value else ""
+        if status == "NOT_REQUIRED":
+            return {"key": key, "value": "", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER", "source_id": question.get("id")}
+        if status == "CONFIRMED" and value:
+            return {"key": key, "value": value, "status": "CONFIRMED", "source": "DISCOVERY_ANSWER", "source_id": question.get("id")}
+        if status == "INFERRED" and value:
+            return {"key": key, "value": value, "status": "INFERRED", "source": "INFERENCE", "source_id": question.get("id")}
+        if status == "UNKNOWN":
+            return {"key": key, "value": "", "status": "UNKNOWN", "source": "UNKNOWN", "source_id": question.get("id")}
+
+    value = project.get(field) if field else None
+    if not value and key == "purpose":
+        value = project.get("business_goal") or project.get("main_problem")
+    if value:
+        return {"key": key, "value": value, "status": "CONFIRMED", "source": "USER_INPUT", "source_id": field}
+
+    understanding = (_discovery(project).get("analysis") or {}).get("understanding") or {}
+    inferred = understanding.get(key) or understanding.get(category) or understanding.get(field)
+    if inferred:
+        return {"key": key, "value": inferred, "status": "INFERRED", "source": "INFERENCE", "source_id": "analysis"}
+
+    status = completeness.get("category_status", {}).get(category, "UNKNOWN")
+    source = "DOMAIN_RULE" if status == "NOT_REQUIRED" else "UNKNOWN"
+    return {"key": key, "value": "", "status": status, "source": source, "source_id": "completeness" if source == "DOMAIN_RULE" else None}
+
+
+def build_product_understanding(project: dict) -> dict:
+    completeness = completeness_check(project)
+    items = {
+        key: _review_item(project, key, category, field, completeness)
+        for key, category, field in _REVIEW_FIELDS
+    }
+    confirmed = [item for item in items.values() if item["status"] == "CONFIRMED"]
+    inferred = [item for item in items.values() if item["status"] == "INFERRED"]
+    unknown = [item for item in items.values() if item["status"] == "UNKNOWN"]
+    not_required = [item for item in items.values() if item["status"] == "NOT_REQUIRED"]
+    out_of_scope = [items["non_goals"]] if items["non_goals"]["status"] != "UNKNOWN" else []
+    if completeness.get("category_status", {}).get("shipping") == "NOT_REQUIRED":
+        out_of_scope.append({"key": "shipping", "value": "", "status": "NOT_REQUIRED", "source": "DOMAIN_RULE", "source_id": "completeness"})
+    in_scope = [item for item in confirmed + inferred if item["key"] != "non_goals"]
+    return {
+        "summary": items,
+        "decisions": {item["key"]: item for item in confirmed},
+        "features": items["core_features"],
+        "roles": items["roles"],
+        "workflows": items["workflows"],
+        "scope": {"in_scope": in_scope, "out_of_scope": out_of_scope},
+        "unknowns": unknown,
+        "inferences": inferred,
+        "non_goals": items["non_goals"],
+        "confirmed_items": confirmed,
+        "inferred_items": inferred,
+        "unknown_items": unknown,
+        "not_required_items": not_required,
+        "readiness": completeness["readiness"],
+    }
+
+
+def build_discovery_review(project: dict) -> dict:
+    completeness = completeness_check(project)
+    understanding = build_product_understanding(project)
+    status = project.get("discovery_status", "none")
+    confirmation_snapshot = _discovery(project).get("confirmation_snapshot")
+    review = {
+        "summary": understanding["summary"],
+        "decisions": understanding["decisions"],
+        "features": understanding["features"],
+        "roles": understanding["roles"],
+        "workflows": understanding["workflows"],
+        "scope": understanding["scope"],
+        "unknowns": understanding["unknowns"],
+        "inferences": understanding["inferences"],
+        "non_goals": understanding["non_goals"],
+        "readiness": completeness["readiness"],
+        "confirmation_state": {"status": status, "confirmed_at": _discovery(project).get("confirmed_at"),
+                                "snapshot_available": bool(confirmation_snapshot)},
+    }
+    return {
+        "review": review,
+        "product_understanding": understanding,
+        "completeness": completeness,
+        "confirmed_items": understanding["confirmed_items"],
+        "inferred_items": understanding["inferred_items"],
+        "unknown_items": understanding["unknown_items"],
+        "not_required_items": understanding["not_required_items"],
+        "readiness": completeness["readiness"],
+        "can_edit": True,
+        "can_confirm": status == "awaiting_confirmation" and completeness["complete"],
+        "confirmation_snapshot": confirmation_snapshot,
+    }
+
+
+def _invalidate_discovery_confirmation(project: dict) -> None:
+    disc = _discovery(project)
+    disc["confirmed_at"] = None
+    disc["summary"] = {}
+    disc["confirmation_invalidated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _snapshot_discovery_answers(project: dict) -> dict:
+    snapshot = {}
+    for q in _discovery_questions(project):
+        qid = q.get("id")
+        answer = (_discovery(project).get("answers") or {}).get(qid)
+        if answer is None:
+            continue
+        copied = deepcopy(answer)
+        if any(term in str(q.get("question") or "").lower() for term in _SECRET_TERMS):
+            copied["value"] = "[REDACTED]"
+        snapshot[qid] = copied
+    return snapshot
+
+
 async def _load_owned_project(project_id: str, user: dict) -> dict:
     p = await db.projects.find_one({"id": project_id, "user_id": user["user_id"]}, {"_id": 0})
     if not p:
@@ -1206,6 +1356,8 @@ async def discovery_analyze(project_id: str, user: dict = Depends(get_current_us
     new_questions = materialize_discovery_questions(analysis.questions, disc)
     disc["questions"] = _merge_questions(disc["questions"], new_questions)
     disc["analysis"] = analysis.model_dump()
+    if project.get("discovery_status") == "in_progress" and completeness_check(project)["complete"]:
+        project["discovery_status"] = transition_discovery_status("in_progress", "awaiting_confirmation")
     await _save_discovery(project_id, user, project)
     return {"discovery_status": project["discovery_status"], "discovery": disc}
 
@@ -1216,6 +1368,14 @@ async def get_discovery(project_id: str, user: dict = Depends(get_current_user))
     return {"discovery_status": project.get("discovery_status"), "discovery": _discovery(project)}
 
 
+@api_router.get("/projects/{project_id}/discovery/review")
+async def discovery_review(project_id: str, user: dict = Depends(get_current_user)):
+    project = await _load_owned_project(project_id, user)
+    if project.get("discovery_status") in (None, "none"):
+        raise HTTPException(status_code=409, detail="Discovery belum dimulai. Jalankan analyze terlebih dahulu.")
+    return build_discovery_review(project)
+
+
 @api_router.post("/projects/{project_id}/discovery/answers")
 async def discovery_answers(project_id: str, body: DiscoveryAnswersRequest, user: dict = Depends(get_current_user)):
     project = await _load_owned_project(project_id, user)
@@ -1224,15 +1384,22 @@ async def discovery_answers(project_id: str, body: DiscoveryAnswersRequest, user
     disc = _discovery(project)
     qids = {q.get("id") for q in _discovery_questions(project)}
     answers = dict(disc.get("answers") or {})
+    was_confirmed = project.get("discovery_status") == "confirmed"
+    answer_changed = False
     for qid, ans in body.answers.items():
         if qid not in qids:
             raise HTTPException(status_code=400, detail=f"question_id tidak dikenal: {qid}")
         if ans.status not in DISCOVERY_ANSWER_STATUSES:
             raise HTTPException(status_code=400, detail=f"Status jawaban tidak valid: {ans.status}")
-        answers[qid] = {"value": ans.value, "status": ans.status}
+        next_answer = {"value": ans.value, "status": ans.status}
+        answer_changed = answer_changed or answers.get(qid) != next_answer
+        answers[qid] = next_answer
+    if was_confirmed and answer_changed:
+        project["discovery_status"] = transition_discovery_status("confirmed", "in_progress")
+        _invalidate_discovery_confirmation(project)
     disc["answers"] = answers
     check = completeness_check(project)
-    if project.get("discovery_status") == "in_progress" and check["complete"]:
+    if not (was_confirmed and answer_changed) and project.get("discovery_status") == "in_progress" and check["complete"]:
         project["discovery_status"] = transition_discovery_status("in_progress", "awaiting_confirmation")
     elif project.get("discovery_status") == "awaiting_confirmation" and not check["complete"]:
         project["discovery_status"] = transition_discovery_status("awaiting_confirmation", "in_progress")
@@ -1260,7 +1427,19 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
         raise HTTPException(status_code=422, detail="Canonical spec invalid: " + "; ".join(issues))
     disc = _discovery(project)
     disc["confirmed_at"] = datetime.now(timezone.utc).isoformat()
-    disc["summary"] = build_discovery_summary(project)
+    understanding = build_product_understanding(project)
+    disc["summary"] = understanding
+    snapshot = {
+        "answers": _snapshot_discovery_answers(project),
+        "summary": deepcopy(understanding),
+        "completeness": deepcopy(check),
+        "status": "confirmed",
+        "confirmed_at": disc["confirmed_at"],
+    }
+    snapshots = list(disc.get("confirmation_snapshots") or [])
+    snapshots.append(snapshot)
+    disc["confirmation_snapshots"] = snapshots
+    disc["confirmation_snapshot"] = snapshot
     updates["discovery_status"] = "confirmed"
     updates["discovery"] = disc
     await db.projects.update_one({"id": project_id, "user_id": user["user_id"]}, {"$set": updates})
@@ -1305,8 +1484,14 @@ async def get_project(project_id: str, user: dict = Depends(get_current_user)):
 
 @api_router.put("/projects/{project_id}")
 async def update_project(project_id: str, body: ProjectUpdate, user: dict = Depends(get_current_user)):
+    project = await _load_owned_project(project_id, user)
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if project.get("discovery_status") == "confirmed" and any(project.get(k) != value for k, value in updates.items() if k != "updated_at"):
+        project["discovery_status"] = transition_discovery_status("confirmed", "in_progress")
+        _invalidate_discovery_confirmation(project)
+        updates["discovery_status"] = project["discovery_status"]
+        updates["discovery"] = _discovery(project)
     result = await db.projects.update_one({"id": project_id, "user_id": user["user_id"]}, {"$set": updates})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Project not found")
