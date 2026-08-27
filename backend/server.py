@@ -688,11 +688,17 @@ def canonical_project_decisions(project: dict) -> str:
     return render_canonical_spec(build_canonical_spec(project))
 
 
+def canonical_spec_fingerprint(spec: CanonicalProductSpec) -> str:
+    payload = json.dumps(spec.model_dump(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 # ---------- Discovery state (D0.1) ----------
 # Structured requirement discovery sits ON TOP of the existing PRD engine. This layer
 # only owns the state machine + generation guard; the AI analyzer/completeness engine
 # land in D0.2+. Legacy projects (no discovery_status field) are treated as "confirmed".
 DISCOVERY_STATUSES = ("none", "in_progress", "awaiting_confirmation", "confirmed")
+DISCOVERY_CONFIRMATION_REQUIRED = "DISCOVERY_CONFIRMATION_REQUIRED"
 _DISCOVERY_TRANSITIONS = {
     "none": {"in_progress"},
     "in_progress": {"awaiting_confirmation", "none"},
@@ -711,6 +717,20 @@ def transition_discovery_status(current: str, new: str) -> str:
 
 def discovery_confirmed(project: dict) -> bool:
     return project.get("discovery_status", "confirmed") == "confirmed"
+
+
+def require_discovery_confirmation(project: dict) -> None:
+    if discovery_confirmed(project):
+        return
+    status = project.get("discovery_status", "none")
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": DISCOVERY_CONFIRMATION_REQUIRED,
+            "message": "Discovery belum selesai. Selesaikan dan konfirmasi discovery terlebih dahulu.",
+            "discovery_status": status,
+        },
+    )
 
 
 # ---------- Discovery pipeline (D0.2, deterministic, no LLM) ----------
@@ -2655,6 +2675,12 @@ def prd_chunk_user_prompt(project: dict, language: str, start: int, end: int) ->
     _fc = project.get("_frozen_context") or {}
     frozen = _fc.get("frozen") or canonical_project_decisions(project)
     rules = _fc.get("rules") or canonical_mvp_decisions(project)
+    snapshot = _fc.get("discovery_snapshot")
+    discovery_context = json.dumps({
+        "status": snapshot.get("status"),
+        "confirmed_at": snapshot.get("confirmed_at"),
+        "product_understanding": _fc.get("product_understanding"),
+    }, sort_keys=True, ensure_ascii=True) if snapshot else "(legacy project; no discovery snapshot)"
     dep = render_dependency_context(project.get("_dependency_context")) if project.get("_dependency_context") else ""
     if end - start == 1:
         word_limit = 600 if start in {5, 6} else 350 if start == 8 else 220
@@ -2665,6 +2691,9 @@ Project requirements:
 
 FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT change them):
 {frozen}
+
+FROZEN CONFIRMED DISCOVERY CONTEXT (reference only; do not reinterpret decisions):
+{discovery_context}
 
 {rules}
 
@@ -2683,6 +2712,9 @@ Project requirements:
 
 FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT change them):
 {frozen}
+
+FROZEN CONFIRMED DISCOVERY CONTEXT (reference only; do not reinterpret decisions):
+{discovery_context}
 
 {rules}
 
@@ -2762,6 +2794,8 @@ async def stream_prd(provider: str, api_key: str, base_url: str, model: str, pro
     for start, end in ranges:
         deps = build_dependency_context(compiled, start, end)
         proj = dict(project)
+        proj["_frozen_context"] = deepcopy(project.get("_frozen_context") or {})
+        proj["_frozen_context"]["relevant_dependencies"] = deepcopy(deps)
         if deps:
             proj["_dependency_context"] = deps
         chunk = await generate_prd_chunk(provider, api_key, base_url, model, proj, language, start, end)
@@ -2782,12 +2816,14 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
         # Phase 5: freeze the generation context ONCE, before any provider runs, so a
         # fallback provider receives the IDENTICAL canonical spec + domain rules, never a
         # rebuild from the raw project input. Deterministic, immutable, no drift.
-        frozen_spec = build_canonical_spec(project)
-        project["_frozen_canonical_spec"] = frozen_spec.model_dump()
-        project.setdefault("_frozen_context", {
-            "frozen": render_canonical_spec(frozen_spec),
-            "rules": canonical_mvp_decisions(project),
-        })
+        frozen_spec = (
+            CanonicalProductSpec.model_validate(deepcopy(job["canonical_spec"]))
+            if job.get("canonical_spec")
+            else build_canonical_spec(project)
+        )
+        project = _freeze_generation_project(project, frozen_spec)
+        metadata = project["_generation_metadata"]
+        job.update(metadata, canonical_spec=frozen_spec.model_dump(), generation_context=deepcopy(project["_frozen_context"]))
 
         for index, (provider, model, api_key, base_url) in enumerate(attempts):
             provider_used, model_used = provider, model
@@ -2850,6 +2886,7 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
                 "id": str(uuid.uuid4()), "project_id": project_id, "user_id": user["user_id"],
                 "content": content, "version": version, "language": language,
                 "edited": False, "connected_consistency": report, "created_at": now,
+                **metadata,
             })
             await db.projects.update_one({"id": project_id}, {"$set": {"prd_status": "completed", "updated_at": now}})
         else:
@@ -2857,6 +2894,7 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
             await db.ai_prompts.insert_one({
                 "id": str(uuid.uuid4()), "project_id": project_id, "user_id": user["user_id"],
                 "content": content, "version": version, "language": language, "created_at": now,
+                **metadata,
             })
             await db.projects.update_one({"id": project_id}, {"$set": {"prompt_status": "completed", "updated_at": now}})
         await db.usage_records.insert_one({
@@ -2876,13 +2914,32 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
         })
 
 
+def _generation_metadata(project: dict, canonical_spec: CanonicalProductSpec) -> dict:
+    confirmed = project.get("discovery_status") == "confirmed"
+    return {
+        "generation_source": "confirmed_discovery" if confirmed else "legacy_project",
+        "canonical_spec_fingerprint": canonical_spec_fingerprint(canonical_spec),
+        "discovery_confirmation_timestamp": _discovery(project).get("confirmed_at") if confirmed else None,
+    }
+
+
 def _freeze_generation_project(project: dict, canonical_spec: CanonicalProductSpec) -> dict:
     frozen = deepcopy(project)
-    frozen["_frozen_canonical_spec"] = canonical_spec.model_dump()
+    metadata = _generation_metadata(frozen, canonical_spec)
+    snapshot = deepcopy(_discovery(frozen).get("confirmation_snapshot")) if frozen.get("discovery_status") == "confirmed" else None
+    frozen_spec = canonical_spec.model_dump()
+    frozen["_frozen_canonical_spec"] = frozen_spec
     frozen["_frozen_context"] = {
+        "canonical_spec": frozen_spec,
+        "canonical_spec_fingerprint": metadata["canonical_spec_fingerprint"],
+        "discovery_snapshot": snapshot,
+        "product_understanding": deepcopy(snapshot.get("summary")) if snapshot else None,
+        "relevant_dependencies": None,
+        "raw_idea_reference": frozen.get("description", ""),
         "frozen": render_canonical_spec(canonical_spec),
         "rules": canonical_mvp_decisions(frozen),
     }
+    frozen["_generation_metadata"] = metadata
     return frozen
 
 
@@ -2895,6 +2952,9 @@ def start_generation_job(generation_type: str, project: dict, user: dict, system
     GENERATION_JOBS[job_id] = {
         "status": "running", "content": "", "error": None, "user_id": user["user_id"],
         "canonical_spec": canonical_spec.model_dump() if canonical_spec else None,
+        "generation_source": _generation_metadata(project, canonical_spec)["generation_source"] if canonical_spec else None,
+        "canonical_spec_fingerprint": canonical_spec_fingerprint(canonical_spec) if canonical_spec else None,
+        "discovery_confirmation_timestamp": _generation_metadata(project, canonical_spec)["discovery_confirmation_timestamp"] if canonical_spec else None,
     }
     if len(GENERATION_JOBS) > 100:
         for k in [k for k, v in GENERATION_JOBS.items() if v["status"] != "running"][:50]:
@@ -3128,12 +3188,11 @@ async def submit_manual_payment(body: ManualPaymentSubmission, user: dict = Depe
 
 @api_router.post("/projects/{project_id}/generate-prd")
 async def generate_prd(project_id: str, body: GenerateRequest, user: dict = Depends(get_current_user)):
-    await check_generation_limit(user, "prd")
     project = await db.projects.find_one({"id": project_id, "user_id": user["user_id"]}, {"_id": 0})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if not discovery_confirmed(project):
-        raise HTTPException(status_code=400, detail=f"Discovery belum selesai (status: {project.get('discovery_status')}). Selesaikan dan konfirmasi discovery terlebih dahulu.")
+    require_discovery_confirmation(project)
+    await check_generation_limit(user, "prd")
     try:
         spec = build_and_validate_project_spec(project)
     except ValueError as error:
@@ -3145,15 +3204,14 @@ async def generate_prd(project_id: str, body: GenerateRequest, user: dict = Depe
 
 @api_router.post("/projects/{project_id}/generate-agent-prompt")
 async def generate_agent_prompt(project_id: str, body: GenerateRequest, user: dict = Depends(get_current_user)):
-    await check_generation_limit(user, "agent_prompt")
     project = await db.projects.find_one({"id": project_id, "user_id": user["user_id"]}, {"_id": 0})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_discovery_confirmation(project)
+    await check_generation_limit(user, "agent_prompt")
     prd = await db.prd_documents.find_one({"project_id": project_id}, {"_id": 0}, sort=[("version", -1)])
     if not prd:
         raise HTTPException(status_code=400, detail="Generate the PRD first")
-    if not discovery_confirmed(project):
-        raise HTTPException(status_code=400, detail=f"Discovery belum selesai (status: {project.get('discovery_status')}). Selesaikan dan konfirmasi discovery terlebih dahulu.")
     try:
         spec = build_and_validate_project_spec(project)
     except ValueError as error:
@@ -3170,7 +3228,12 @@ async def get_generation(job_id: str, user: dict = Depends(get_current_user)):
     job = GENERATION_JOBS.get(job_id)
     if not job or job["user_id"] != user["user_id"]:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"status": job["status"], "content": job["content"], "error": job["error"], "report": job.get("report")}
+    return {
+        "status": job["status"], "content": job["content"], "error": job["error"], "report": job.get("report"),
+        "generation_source": job.get("generation_source"),
+        "canonical_spec_fingerprint": job.get("canonical_spec_fingerprint"),
+        "discovery_confirmation_timestamp": job.get("discovery_confirmation_timestamp"),
+    }
 
 
 @api_router.get("/projects/{project_id}/prd")

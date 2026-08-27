@@ -1,5 +1,6 @@
 import asyncio
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -2822,3 +2823,250 @@ def test_d06_generation_freeze_survives_live_project_mutation():
     assert server.build_canonical_spec(frozen).model_dump() == spec.model_dump()
     assert "operators" in server.project_context(frozen)
     assert "changed during fallback" not in server.project_context(frozen)
+
+
+# ---------- D0.7: full discovery -> PRD generation integration ----------
+
+@pytest.mark.parametrize("status", ["none", "in_progress", "awaiting_confirmation"])
+def test_d07_new_project_guard_is_structured_and_before_ai(monkeypatch, status):
+    calls = _mock_generation_env(monkeypatch, {"name": "New", "discovery_status": status})
+    ai_calls = []
+    monkeypatch.setattr(server, "stream_openai_compatible", lambda *a, **k: ai_calls.append(1))
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert error.value.detail["code"] == server.DISCOVERY_CONFIRMATION_REQUIRED
+    assert calls == [] and ai_calls == []
+
+
+def test_d07_agent_prompt_guard_precedes_missing_prd(monkeypatch):
+    _mock_generation_env(monkeypatch, {"name": "New", "discovery_status": "none"})
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.generate_agent_prompt("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert error.value.detail["code"] == server.DISCOVERY_CONFIRMATION_REQUIRED
+
+
+def test_d07_confirmed_generation_freezes_snapshot_and_canonical_context(monkeypatch):
+    project = _d06_confirmed_project()
+    project["target_users"] = "raw conflicting users"
+    _mock_generation_env(monkeypatch, project)
+    captured = []
+    monkeypatch.setattr(server, "start_generation_job", lambda *a, **k: captured.append((a, k)) or "JOB-1")
+    out = asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    assert out["job_id"] == "JOB-1"
+    generation_project = captured[0][0][1]
+    spec = captured[0][1]["canonical_spec"]
+    context = generation_project["_frozen_context"]
+    assert spec.target_users == "operators"
+    assert context["canonical_spec"]["target_users"] == "operators"
+    assert context["discovery_snapshot"]["status"] == "confirmed"
+    assert context["product_understanding"] == context["discovery_snapshot"]["summary"]
+    assert "raw conflicting users" not in server.prd_chunk_user_prompt(generation_project, "id", 0, 1)
+
+
+def test_d07_confirm_then_generate_e2e_uses_same_snapshot(monkeypatch):
+    store = _confirm_project(monkeypatch)
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    snapshot = deepcopy(store["projects"]["p1"]["discovery"]["confirmation_snapshot"])
+    store["projects"]["p1"]["target_users"] = "tampered raw value"
+    _mock_generation_env(monkeypatch, store["projects"]["p1"])
+    captured = []
+    monkeypatch.setattr(server, "start_generation_job", lambda *a, **k: captured.append((a, k)) or "JOB-1")
+    asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "u1", "plan": "free"}))
+    generation_project = captured[0][0][1]
+    assert generation_project["discovery"]["confirmation_snapshot"] == snapshot
+    assert captured[0][1]["canonical_spec"].target_users == "teams"
+
+
+def test_d07_full_confirm_to_prd_result_e2e(monkeypatch):
+    store = _confirm_project(monkeypatch)
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    project = store["projects"]["p1"]
+    calls, _, _, job = _run_generation_job(
+        monkeypatch, project, [("9router", "m1", "k1", "u1")], fail_first=False,
+    )
+    assert job["status"] == "completed"
+    assert calls[0][1]["discovery_snapshot"]["status"] == "confirmed"
+    assert calls[0][1]["canonical_spec"]["target_users"] == "teams"
+
+
+def test_d07_all_sections_receive_same_canonical_and_relevant_dependencies(monkeypatch):
+    project = _d06_confirmed_project()
+    spec = server.build_canonical_spec(project)
+    project = server._freeze_generation_project(project, spec)
+    seen = []
+
+    async def fake_chunk(provider, api_key, base_url, model, current, language, start, end):
+        seen.append(current)
+        return "\n\n".join(f"{heading}\n\nConcrete details" for heading in server.REQUIRED_PRD_HEADINGS[start:end])
+
+    monkeypatch.setattr(server, "generate_prd_chunk", fake_chunk)
+
+    async def collect():
+        return [chunk async for chunk in server.stream_prd("9router", "k", "u", "m", project, "id", "s", "u")]
+
+    asyncio.run(collect())
+    assert seen
+    frozen_specs = {json.dumps(item["_frozen_canonical_spec"], sort_keys=True) for item in seen}
+    snapshots = {json.dumps(item["_frozen_context"]["discovery_snapshot"], sort_keys=True) for item in seen}
+    assert len(frozen_specs) == 1 and len(snapshots) == 1
+    assert any(item.get("_dependency_context") for item in seen)
+
+
+def test_d07_fallback_keeps_snapshot_and_context_identical(monkeypatch):
+    project = _d06_confirmed_project()
+    snapshot = deepcopy(project["discovery"]["confirmation_snapshot"])
+    calls, _, _, _ = _run_generation_job(
+        monkeypatch, project, [("9router", "m1", "k1", "u1"), _ds], fail_first=True,
+    )
+    assert calls[0][1] == calls[1][1]
+    assert calls[0][1]["discovery_snapshot"] == snapshot
+    assert calls[0][1]["canonical_spec_fingerprint"]
+
+
+def test_d07_repair_keeps_canonical_and_snapshot_unchanged(monkeypatch):
+    project = _d06_confirmed_project()
+    before_spec = server.build_canonical_spec(project).model_dump()
+    before_snapshot = deepcopy(project["discovery"]["confirmation_snapshot"])
+    monkeypatch.setattr(
+        server, "stream_openai_compatible",
+        _fake_stream_fix("## 9. Integrations, Payments, and Notifications\n\nPayment via Midtrans.\n"),
+    )
+    content = _prd({8: "Payment via Stripe."})
+    out, _ = asyncio.run(server.repair_prd(content, project, "9router", "k", "u", "m", "id"))
+    assert "Midtrans" in out and "Stripe" not in out
+    assert server.build_canonical_spec(project).model_dump() == before_spec
+    assert project["discovery"]["confirmation_snapshot"] == before_snapshot
+
+
+def test_d07_canonical_build_has_no_llm_call(monkeypatch):
+    monkeypatch.setattr(server, "_ai_analyze_discovery", lambda *a, **k: (_ for _ in ()).throw(AssertionError("AI called")))
+    assert server.build_canonical_spec(_d06_confirmed_project()).target_users == "operators"
+
+
+def test_d07_persistence_records_confirmed_discovery_metadata(monkeypatch):
+    project = _d06_confirmed_project()
+    project["discovery"]["confirmed_at"] = "2026-08-28T00:00:00+00:00"
+    project["discovery"]["confirmation_snapshot"]["confirmed_at"] = project["discovery"]["confirmed_at"]
+    inserted = []
+
+    class _Col:
+        async def count_documents(self, *a, **k):
+            return 0
+        async def insert_one(self, doc):
+            inserted.append(doc)
+        async def update_one(self, *a, **k):
+            return None
+
+    class _Db:
+        def __init__(self):
+            self.prd_documents = _Col()
+            self.ai_prompts = _Col()
+            self.projects = _Col()
+            self.usage_records = _Col()
+
+    monkeypatch.setattr(server, "db", _Db())
+    async def attempts():
+        return [("9router", "m", "k", "https://example.test/v1")]
+    monkeypatch.setattr(server, "build_ai_attempts", attempts)
+    async def fake_stream(*a, **k):
+        yield "x" * 240
+    monkeypatch.setattr(server, "stream_openai_compatible", fake_stream)
+    job = {"status": "running", "content": "", "error": None, "user_id": "u1"}
+    server.GENERATION_JOBS["d07-metadata"] = job
+    asyncio.run(server.run_generation_job("d07-metadata", "agent_prompt", project, {"user_id": "u1"}, "system", "user", "id"))
+    assert job["status"] == "completed"
+    output = next(doc for doc in inserted if doc.get("generation_source"))
+    assert output["generation_source"] == "confirmed_discovery"
+    assert output["canonical_spec_fingerprint"] == job["canonical_spec_fingerprint"]
+    assert output["discovery_confirmation_timestamp"] == project["discovery"]["confirmed_at"]
+
+
+def test_d07_cross_project_snapshot_cannot_be_used(monkeypatch):
+    project = _d06_confirmed_project()
+
+    class _Projects:
+        async def find_one(self, query, *a, **k):
+            return project if query.get("user_id") == "owner" else None
+
+    class _Db:
+        projects = _Projects()
+
+    monkeypatch.setattr(server, "db", _Db())
+    async def no_limit(*a, **k):
+        return None
+    monkeypatch.setattr(server, "check_generation_limit", no_limit)
+    monkeypatch.setattr(server, "start_generation_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("job created")))
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.generate_prd("p1", server.GenerateRequest(), {"user_id": "attacker", "plan": "free"}))
+    assert error.value.status_code == 404
+
+
+def _d07_realistic_project(product, product_type, users, features, decisions, out_of_scope=()):
+    items = {
+        "product": {"value": product, "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "product_type": {"value": product_type, "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "target_users": {"value": users, "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "core_features": {"value": features, "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+    }
+    items.update(decisions)
+    snapshot = {
+        "summary": {"summary": items, "scope": {"in_scope": [], "out_of_scope": list(out_of_scope)}},
+        "answers": {}, "status": "confirmed", "confirmed_at": "2026-08-28T00:00:00+00:00",
+        "original_project_fields": {},
+    }
+    return {
+        "id": "p1", "user_id": "u1", "name": product, "description": product, "product_type": product_type,
+        "discovery_status": "confirmed",
+        "discovery": {"questions": [], "answers": {}, "confirmed_at": snapshot["confirmed_at"], "confirmation_snapshot": snapshot},
+    }
+
+
+@pytest.mark.parametrize("case", [
+    _d07_realistic_project(
+        "Retail POS", "POS", "Owner, Admin, Kasir", "Product; Inventory; Sales Transaction; Payment; Receipt; Reports",
+        {
+            "payment": {"value": "Cash + QRIS", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+            "inventory": {"value": "Enabled", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+            "technology": {"value": "", "status": "UNKNOWN", "source": "UNKNOWN"},
+            "infrastructure": {"value": "", "status": "UNKNOWN", "source": "UNKNOWN"},
+        },
+        (
+            {"key": "shipping", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER"},
+            {"key": "online_store", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER"},
+        ),
+    ),
+    _d07_realistic_project(
+        "Project Management SaaS", "SaaS", "Project Manager + Team Members", "Workspace; Project; Task; Assignment; Dashboard",
+        {
+            "authentication": {"value": "Google OAuth", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+            "payment": {"value": "", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER"},
+            "technology": {"value": "Next.js + PostgreSQL", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+            "infrastructure": {"value": "", "status": "UNKNOWN", "source": "UNKNOWN"},
+        },
+    ),
+    _d07_realistic_project(
+        "AI Document Analyzer", "AI SaaS", "Business Analysts", "Document Upload; AI Summary; AI Analysis",
+        {
+            "ai_capability": {"value": "Confirmed document summarization and analysis", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+            "technology": {"value": "", "status": "UNKNOWN", "source": "UNKNOWN"},
+            "infrastructure": {"value": "", "status": "UNKNOWN", "source": "UNKNOWN"},
+        },
+    ),
+], ids=["pos", "saas", "ai-saas"])
+def test_d07_realistic_confirmed_cases_generate_with_frozen_context(monkeypatch, case):
+    spec = server.build_canonical_spec(case)
+    prompt = server.prd_chunk_user_prompt(server._freeze_generation_project(case, spec), "id", 0, 1)
+    calls, _, _, job = _run_generation_job(monkeypatch, case, [("9router", "m1", "k1", "u1")], fail_first=False)
+    assert job["status"] == "completed"
+    assert calls[0][1]["canonical_spec"] == spec.model_dump()
+    if case["product_type"] == "POS":
+        assert spec.domain == "commerce" and spec.payments == "Cash + QRIS" and spec.inventory == "Enabled"
+        assert spec.shipping == "" and spec.online_store == ""
+    elif case["product_type"] == "SaaS":
+        assert spec.domain == "generic" and spec.technology == "Next.js + PostgreSQL"
+        assert spec.database == "PostgreSQL" and spec.authentication == "Google OAuth" and spec.payments == ""
+        frozen = server.render_canonical_spec(spec)
+        assert "Vercel" not in frozen and "Neon" not in frozen and "Stripe" not in frozen
+    else:
+        assert spec.ai_capability.startswith("Confirmed") and spec.technology == ""
+        assert all(provider not in prompt for provider in ("OpenAI", "Anthropic", "DeepSeek", "Gemini"))
