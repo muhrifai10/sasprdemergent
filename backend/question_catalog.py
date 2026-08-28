@@ -150,12 +150,13 @@ def _template(
 
 _PERSISTENT_DATA = [ConditionalRule(category="CORE_FUNCTIONALITY", condition="contains_persistent_data")]
 _DIGITAL_PAYMENT = [ConditionalRule(category="PAYMENT_METHOD", condition="indicates_digital_payment")]
+_ALL_DOMAINS = ["POS", "SaaS", "E-Commerce", "AI SaaS", "Generic", "Internal Tool", "CMS"]
 
 QUESTION_CATALOG = (
-    _template("product.identity", "PRODUCT", "What is the product name?", "text", required=True, priority=100),
-    _template("product.purpose", "PURPOSE", "What problem or purpose should the product address?", "textarea", required=True, priority=95),
-    _template("target.users", "TARGET_USERS", "Who are the target users?", "textarea", required=True, priority=95),
-    _template("functionality.core", "CORE_FUNCTIONALITY", "Which core capabilities are required?", "textarea", required=True, priority=95),
+    _template("product.identity", "PRODUCT", "What is the product name?", "text", required=True, domains=_ALL_DOMAINS, priority=100),
+    _template("product.purpose", "PURPOSE", "What problem or purpose should the product address?", "textarea", required=True, domains=_ALL_DOMAINS, priority=95),
+    _template("target.users", "TARGET_USERS", "Who are the target users?", "textarea", required=True, domains=_ALL_DOMAINS, priority=95),
+    _template("functionality.core", "CORE_FUNCTIONALITY", "Which core capabilities are required?", "textarea", required=True, domains=_ALL_DOMAINS, priority=95),
     _template(
         "roles.permissions", "ROLES_PERMISSIONS", "What roles and permissions are required?", "textarea",
         domains=["POS", "SaaS", "E-Commerce", "AI SaaS", "Generic", "Internal Tool", "CMS"],
@@ -205,7 +206,8 @@ QUESTION_CATALOG = (
     ),
     _template(
         "payment.method", "PAYMENT_METHOD", "Which payment methods must be supported?", "multi_choice",
-        options=["Cash", "QRIS", "Card", "Bank Transfer", "Other", "Unknown"],
+        options=["Cash", "QRIS", "Bank Transfer", "Card", "Other", "Unknown"],
+        recommendation_policy="catalog_default", recommendation_reason="Common payment methods for an in-person or online transaction flow.",
         domains=["POS", "E-Commerce"], priority=80, allow_custom=True, allow_unknown=True,
     ),
     _template(

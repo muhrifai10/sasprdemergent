@@ -37,6 +37,8 @@ from user_decisions import (
     effective_answers,
     record_decision,
 )
+from question_planner import PlannerContext, PlannerResult, plan_question_ids, planner_context_from_project
+from recommendation_engine import RecommendationContext, recommendations_for_question
 
 try:
     from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
@@ -1260,6 +1262,21 @@ async def _ai_analyze_discovery(project: dict) -> DiscoveryAnalysis:
     raise RuntimeError("Discovery AI analysis failed on all providers")
 
 
+async def plan_guided_discovery_questions(
+    project: dict,
+    *,
+    blocking_gaps: list[str] | None = None,
+    relevant_categories: list[str] | None = None,
+) -> PlannerResult:
+    """Plan catalog IDs for guided discovery without changing legacy analysis."""
+    context = planner_context_from_project(
+        project,
+        blocking_gaps=blocking_discovery_categories(project) if blocking_gaps is None else blocking_gaps,
+        relevant_categories=relevant_categories,
+    )
+    return await plan_question_ids(context, await build_ai_attempts(), stream_openai_compatible)
+
+
 def _discovery(project: dict) -> dict:
     disc = project.get("discovery")
     if disc is None:
@@ -1824,6 +1841,32 @@ async def discovery_analyze(project_id: str, user: dict = Depends(get_current_us
 async def get_discovery(project_id: str, user: dict = Depends(get_current_user)):
     project = await _load_owned_project(project_id, user)
     return {"discovery_status": project.get("discovery_status"), "discovery": _discovery(project)}
+
+
+@api_router.get("/projects/{project_id}/discovery/recommendations")
+async def discovery_recommendations(project_id: str, question_id: str, user: dict = Depends(get_current_user)):
+    project = await _load_owned_project(project_id, user)
+    planner_context = planner_context_from_project(project)
+    context = RecommendationContext(
+        raw_idea=planner_context.raw_idea,
+        domain=planner_context.domain,
+        confirmed_decisions=planner_context.confirmed_decisions,
+        unknown_decisions=planner_context.unknown_decisions,
+        not_required_decisions=planner_context.not_required_decisions,
+        relevant_categories=planner_context.relevant_categories,
+        catalog_version=planner_context.catalog_version,
+    )
+    try:
+        recommendations = recommendations_for_question(question_id, context)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    current = next((item for item in current_decisions(_discovery(project)) if item.question_id == question_id), None)
+    return {
+        "question_id": question_id,
+        "catalog_version": CATALOG_VERSION,
+        "current_decision": current.model_dump() if current else None,
+        "recommendations": [item.model_dump() for item in recommendations],
+    }
 
 
 @api_router.get("/projects/{project_id}/discovery/review")

@@ -42,7 +42,21 @@ class Recommendation(BaseModel):
     value: str = Field(min_length=1)
     label: str = Field(min_length=1)
     reason: str = ""
-    source: Literal["CATALOG"] = "CATALOG"
+    tradeoffs: list[str] = Field(default_factory=list)
+    applicability: list[str] = Field(default_factory=list)
+    source: Literal["CATALOG", "AI_ENRICHED_REASON"] = "CATALOG"
+    rank: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def validate_catalog_reference(self):
+        template = get_question_template(self.question_id)
+        if not template:
+            raise ValueError(f"Unknown recommendation question: {self.question_id}")
+        if self.value not in template.options:
+            raise ValueError(f"Recommendation value is not an option for {self.question_id}")
+        if f"{self.question_id}.{_slug(self.value)}" != self.id:
+            raise ValueError(f"Recommendation ID does not match question/value: {self.id}")
+        return self
 
 
 class UserDecisionIntent(BaseModel):
