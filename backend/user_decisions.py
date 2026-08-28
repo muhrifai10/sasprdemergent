@@ -52,7 +52,12 @@ class Recommendation(BaseModel):
         template = get_question_template(self.question_id)
         if not template:
             raise ValueError(f"Unknown recommendation question: {self.question_id}")
-        if self.value not in template.options:
+        recommendation_options = template.options + [
+            option
+            for options in template.recommendation_options.values()
+            for option in options
+        ]
+        if self.value not in recommendation_options:
             raise ValueError(f"Recommendation value is not an option for {self.question_id}")
         if f"{self.question_id}.{_slug(self.value)}" != self.id:
             raise ValueError(f"Recommendation ID does not match question/value: {self.id}")
@@ -107,10 +112,11 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
 
 
-def catalog_recommendation(template: QuestionTemplate, recommendation_id: str) -> Recommendation | None:
+def catalog_recommendation(template: QuestionTemplate, recommendation_id: str, domain: str | None = None) -> Recommendation | None:
     if template.recommendation_policy != "catalog_default":
         return None
-    for option in template.options:
+    options = template.recommendation_options.get(domain or "", template.options)
+    for option in options:
         if option.casefold() in {"other", "unknown", "not required"}:
             continue
         if f"{template.id}.{_slug(option)}" == recommendation_id:
@@ -165,7 +171,7 @@ def decide(
     source_id: str
     value = ""
     if intent.recommendation_id:
-        recommendation = catalog_recommendation(template, intent.recommendation_id)
+        recommendation = catalog_recommendation(template, intent.recommendation_id, domain)
         if not recommendation:
             raise ValueError(f"Invalid recommendation for question: {intent.recommendation_id}")
         value = recommendation.value

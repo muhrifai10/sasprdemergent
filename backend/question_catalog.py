@@ -80,6 +80,7 @@ class QuestionTemplate(BaseModel):
     options: list[str] = Field(default_factory=list)
     recommendation_policy: RecommendationPolicy = "none"
     recommendation_reason: str = ""
+    recommendation_options: dict[str, list[str]] = Field(default_factory=dict)
     required: bool = False
     conditional_on: list[ConditionalRule] = Field(default_factory=list)
     applicable_domains: list[CatalogDomain] = Field(min_length=1)
@@ -103,6 +104,12 @@ class QuestionTemplate(BaseModel):
             raise ValueError(f"{self.type} questions cannot define options")
         if self.recommendation_policy == "catalog_default" and not self.recommendation_reason.strip():
             raise ValueError("catalog_default requires recommendation_reason")
+        if set(self.recommendation_options) - set(self.applicable_domains):
+            raise ValueError("recommendation options must target applicable domains")
+        for options in self.recommendation_options.values():
+            normalized = [option.strip().casefold() for option in options]
+            if any(not option.strip() for option in options) or len(normalized) != len(set(normalized)):
+                raise ValueError("recommendation options must be non-empty and unique")
         if self.allow_not_required and self.category not in _NOT_REQUIRED_CATEGORIES:
             raise ValueError(f"{self.category} cannot allow NOT_REQUIRED")
         if len(self.dependencies) != len(set(self.dependencies)):
@@ -119,6 +126,7 @@ def _template(
     options: list[str] | None = None,
     recommendation_policy: RecommendationPolicy = "none",
     recommendation_reason: str = "",
+    recommendation_options: dict[str, list[str]] | None = None,
     required: bool = False,
     conditional_on: list[ConditionalRule] | None = None,
     domains: list[CatalogDomain] | None = None,
@@ -136,6 +144,7 @@ def _template(
         options=options or [],
         recommendation_policy=recommendation_policy,
         recommendation_reason=recommendation_reason,
+        recommendation_options=recommendation_options or {},
         required=required,
         conditional_on=conditional_on or [],
         applicable_domains=domains or ["Generic"],
@@ -151,12 +160,32 @@ def _template(
 _PERSISTENT_DATA = [ConditionalRule(category="CORE_FUNCTIONALITY", condition="contains_persistent_data")]
 _DIGITAL_PAYMENT = [ConditionalRule(category="PAYMENT_METHOD", condition="indicates_digital_payment")]
 _ALL_DOMAINS = ["POS", "SaaS", "E-Commerce", "AI SaaS", "Generic", "Internal Tool", "CMS"]
+_TARGET_USER_RECOMMENDATIONS = {
+    "POS": ["Owner", "Admin", "Kasir"],
+    "SaaS": ["Owner", "Admin", "Member", "Manager"],
+    "E-Commerce": ["Customer", "Admin", "Operator", "Seller"],
+    "AI SaaS": ["Product Manager", "Analyst", "Team Member", "Administrator"],
+    "Generic": ["Administrator", "Manager", "Team Member", "Internal User"],
+    "Internal Tool": ["Administrator", "Manager", "Operator", "Team Member"],
+    "CMS": ["Administrator", "Editor", "Author", "Viewer"],
+}
+_CORE_FEATURE_RECOMMENDATIONS = {
+    "POS": ["Sales transactions", "Inventory management", "Receipts", "Reports"],
+    "SaaS": ["Projects", "Tasks", "Assignments", "Team dashboard"],
+    "E-Commerce": ["Product catalog", "Cart", "Checkout", "Order management"],
+    "AI SaaS": ["Document upload", "AI analysis", "Results review", "Export"],
+    "Generic": ["Dashboard", "Record management", "Search and filtering", "Reports"],
+    "Internal Tool": ["Monitoring dashboard", "Team status", "Alerts", "Reports"],
+    "CMS": ["Content management", "Draft and publish", "Media library", "Roles and permissions"],
+}
 
 QUESTION_CATALOG = (
     _template("product.identity", "PRODUCT", "What is the product name?", "text", required=True, domains=_ALL_DOMAINS, priority=100),
     _template("product.purpose", "PURPOSE", "What problem or purpose should the product address?", "textarea", required=True, domains=_ALL_DOMAINS, priority=95),
-    _template("target.users", "TARGET_USERS", "Who are the target users?", "textarea", required=True, domains=_ALL_DOMAINS, priority=95),
-    _template("functionality.core", "CORE_FUNCTIONALITY", "Which core capabilities are required?", "textarea", required=True, domains=_ALL_DOMAINS, priority=95),
+    _template("target.users", "TARGET_USERS", "Who are the target users?", "textarea", required=True, domains=_ALL_DOMAINS, priority=95,
+              recommendation_policy="catalog_default", recommendation_reason="Common user groups for this product domain.", recommendation_options=_TARGET_USER_RECOMMENDATIONS),
+    _template("functionality.core", "CORE_FUNCTIONALITY", "Which core capabilities are required?", "textarea", required=True, domains=_ALL_DOMAINS, priority=95,
+              recommendation_policy="catalog_default", recommendation_reason="Common capabilities for this product domain.", recommendation_options=_CORE_FEATURE_RECOMMENDATIONS),
     _template(
         "roles.permissions", "ROLES_PERMISSIONS", "What roles and permissions are required?", "textarea",
         domains=["POS", "SaaS", "E-Commerce", "AI SaaS", "Generic", "Internal Tool", "CMS"],

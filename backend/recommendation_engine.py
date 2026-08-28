@@ -116,7 +116,8 @@ def recommendations_for_question(question_id: str, context: RecommendationContex
         return []
 
     recommendations = []
-    for rank, option in enumerate(template.options, start=1):
+    options = template.recommendation_options.get(normalize_domain(context.domain), template.options)
+    for rank, option in enumerate(options, start=1):
         if option.casefold() in _EXCLUDED_OPTION:
             continue
         reason, tradeoffs = _recommendation_reason(template, option)

@@ -2542,6 +2542,17 @@ def test_d04_inventory_not_relevant_is_not_required():
     assert "inventory" not in result["conditional_missing"]
 
 
+def test_d04_inventory_not_relevant_is_domain_rule_not_user_decision():
+    project = _d04_project(product_type="SaaS", description="A website SaaS PRD generator.")
+    review = server.build_product_understanding(project)
+
+    assert review["summary"]["inventory"] == {
+        "key": "inventory", "value": "", "status": "NOT_REQUIRED",
+        "source": "DOMAIN_RULE", "source_id": "completeness",
+    }
+    assert not server.current_decisions(project["discovery"])
+
+
 def test_d04_absent_integrations_do_not_block():
     result = server.completeness_check(_d04_project(integrations=""))
     assert result["complete"]

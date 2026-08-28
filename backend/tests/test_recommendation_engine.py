@@ -34,6 +34,19 @@ def test_catalog_recommendations_are_typed_and_catalog_bound():
     assert recommendations_for_question("database.selection", RecommendationContext(domain="Generic"))
 
 
+def test_target_and_core_questions_have_domain_specific_catalog_recommendations():
+    pos_users = recommendations_for_question("target.users", context(domain="POS"))
+    saas_users = recommendations_for_question("target.users", context(domain="SaaS"))
+    pos_features = recommendations_for_question("functionality.core", context(domain="POS"))
+    saas_features = recommendations_for_question("functionality.core", context(domain="SaaS"))
+
+    assert [item.value for item in pos_users] == ["Owner", "Admin", "Kasir"]
+    assert [item.value for item in saas_users] == ["Owner", "Admin", "Member", "Manager"]
+    assert [item.value for item in pos_features] == ["Sales transactions", "Inventory management", "Receipts", "Reports"]
+    assert [item.value for item in saas_features] == ["Projects", "Tasks", "Assignments", "Team dashboard"]
+    assert all(item.source == "CATALOG" for item in pos_users + saas_users + pos_features + saas_features)
+
+
 def test_context_and_dependencies_gate_recommendations():
     assert recommendations_for_question("payment.provider", context(domain="SaaS")) == []
     assert recommendations_for_question("payment.provider", context(domain="E-Commerce", confirmed_decisions={"payment.method": "Cash"})) == []
@@ -43,6 +56,7 @@ def test_context_and_dependencies_gate_recommendations():
 def test_confirmed_and_not_required_decisions_suppress_recommendations():
     assert recommendations_for_question("database.selection", context(confirmed_decisions={"database.selection": "PostgreSQL"})) == []
     assert recommendations_for_question("database.selection", context(not_required_decisions=["database.selection"])) == []
+    assert recommendations_for_question("target.users", context(unknown_decisions=["target.users"])) == []
 
 
 def test_recommendation_model_rejects_mismatch_and_batch_duplicates():

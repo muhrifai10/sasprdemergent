@@ -52,6 +52,18 @@ def test_selected_recommendation_becomes_confirmed():
     assert decision.source_id == "database.selection.postgresql"
 
 
+def test_domain_specific_recommendation_selection_is_authoritative_only_after_user_action():
+    template = get_question_template("target.users")
+    assert catalog_recommendation(template, "target.users.owner", "POS").value == "Owner"
+    decision = decide(
+        UserDecisionIntent(question_id="target.users", catalog_version=CATALOG_VERSION, selection="target.users.owner"),
+        domain="POS", actor_id="u1",
+    )
+    assert decision.status == "CONFIRMED"
+    assert decision.value == "Owner"
+    assert decision.source == "USER_RECOMMENDATION_SELECTION"
+
+
 def test_custom_answer_becomes_confirmed_user_custom():
     decision = decide(
         UserDecisionIntent(question_id="database.selection", catalog_version=CATALOG_VERSION, custom_value="MariaDB"),

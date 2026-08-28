@@ -70,6 +70,8 @@ def test_guided_pos_multi_round_catalog_recommendations_and_readiness(monkeypatc
     }
     assert all(item["question"] == server.get_question_template(item["question_id"]).question for item in first["questions"])
     assert next(item for item in first["questions"] if item["question_id"] == "payment.method")["recommendations"]
+    assert [item["value"] for item in next(item for item in first["questions"] if item["question_id"] == "target.users")["recommendations"]] == ["Owner", "Admin", "Kasir"]
+    assert [item["value"] for item in next(item for item in first["questions"] if item["question_id"] == "functionality.core")["recommendations"]] == ["Sales transactions", "Inventory management", "Receipts", "Reports"]
     assert not project["discovery"]["decisions"]
 
     batch = server.GuidedDecisionBatchRequest(decisions=[

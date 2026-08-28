@@ -141,6 +141,16 @@ def test_recommendation_metadata_does_not_select_a_value():
     assert database.options[0] == "PostgreSQL"
 
 
+def test_core_discovery_questions_have_domain_keyed_recommendation_metadata():
+    for question_id in ("target.users", "functionality.core"):
+        template = get_question_template(question_id)
+        assert template.type == "textarea"
+        assert template.options == []
+        assert template.recommendation_policy == "catalog_default"
+        assert set(template.recommendation_options) == set(template.applicable_domains)
+        assert all(template.recommendation_options[domain] for domain in template.applicable_domains)
+
+
 def test_decision_flags_cover_custom_unknown_and_not_required():
     assert get_question_template("database.selection").allow_custom is True
     assert get_question_template("database.selection").allow_unknown is True

@@ -76,6 +76,31 @@ test("recommendations render their label, reason, and tradeoffs", () => {
   expect(container.textContent).toContain("Needs hosting");
 });
 
+test("textarea questions render catalog recommendations alongside custom input", () => {
+  const question = {
+    question_id: "target.users",
+    category: "TARGET_USERS",
+    type: "textarea",
+    recommendations: [{ id: "target.users.owner", value: "Owner", label: "Owner", reason: "Common owner role", tradeoffs: [] }],
+    allow_custom: true,
+    allow_unknown: true,
+    allow_not_required: false,
+  };
+  const container = renderCard(question);
+
+  expect(container.querySelector('[data-testid="guided-recommendations-target.users"]')).toBeTruthy();
+  expect(container.textContent).toContain("Owner");
+  expect(container.querySelector('[data-testid="guided-custom-input-target.users"]')).toBeTruthy();
+  expect(container.querySelector('[data-testid="guided-unknown-target.users"]')).toBeTruthy();
+});
+
+test("questions without recommendations still render without a recommendation panel", () => {
+  const container = renderCard({ ...recommendationQuestion, question_id: "workflow.primary", type: "textarea", recommendations: [] });
+
+  expect(container.querySelector('[data-testid="guided-recommendations-workflow.primary"]')).toBeNull();
+  expect(container.querySelector('[data-testid="guided-custom-input-workflow.primary"]')).toBeTruthy();
+});
+
 test("recommendation selection emits only the client intent", () => {
   const onDraft = jest.fn();
   const container = renderCard(recommendationQuestion, { onDraft });
