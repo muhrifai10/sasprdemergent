@@ -97,7 +97,7 @@ def recommendations_for_question(question_id: str, context: RecommendationContex
         raise ValueError(f"Catalog version mismatch for {question_id}")
     if normalize_domain(context.domain) not in template.applicable_domains:
         return []
-    if question_id in context.confirmed_decisions or _scope_excluded(question_id, context):
+    if question_id in context.confirmed_decisions or question_id in context.unknown_decisions or _scope_excluded(question_id, context):
         return []
     if not _dependency_satisfied(template, context):
         return []

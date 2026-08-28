@@ -65,7 +65,9 @@ class UserDecisionIntent(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     question_id: str = Field(min_length=1)
-    catalog_version: str = Field(pattern=r"^\d+\.\d+$")
+    catalog_version: str = Field(default=CATALOG_VERSION, pattern=r"^\d+\.\d+$")
+    type: Literal["recommendation", "custom", "unknown", "not_required"] | None = None
+    value: str | None = None
     recommendation_id: str | None = Field(default=None, alias="selection")
     custom_value: str | None = None
     unknown: bool = False
@@ -77,6 +79,24 @@ class UserDecisionIntent(BaseModel):
 
     @model_validator(mode="after")
     def require_one_intent(self):
+        if self.type == "custom":
+            if self.recommendation_id or self.unknown or self.not_required:
+                raise ValueError("custom intent cannot include another intent")
+            if not self.custom_value and self.value:
+                self.custom_value = self.value
+        elif self.type == "recommendation":
+            if self.custom_value or self.unknown or self.not_required:
+                raise ValueError("recommendation intent cannot include another intent")
+            if not self.recommendation_id and self.value:
+                self.recommendation_id = self.value
+        elif self.type == "unknown":
+            if self.recommendation_id or self.custom_value or self.value or self.not_required:
+                raise ValueError("unknown intent cannot include another intent")
+            self.unknown = True
+        elif self.type == "not_required":
+            if self.recommendation_id or self.custom_value or self.value or self.unknown:
+                raise ValueError("not_required intent cannot include another intent")
+            self.not_required = True
         branches = bool(self.recommendation_id) + bool(self.custom_value and self.custom_value.strip()) + self.unknown + self.not_required
         if branches != 1:
             raise ValueError("exactly one decision intent is required")
@@ -102,6 +122,9 @@ def catalog_recommendation(template: QuestionTemplate, recommendation_id: str) -
                 reason=template.recommendation_reason,
             )
     return None
+
+
+_BOOLEAN_VALUES = {"yes", "y", "true", "no", "n", "false", "ya", "tidak"}
 
 
 def _dependency_decisions(decisions) -> dict[str, UserDecision]:
@@ -150,7 +173,7 @@ def decide(
         source_id = recommendation.id
         status: DecisionStatus = "CONFIRMED"
     elif intent.custom_value and intent.custom_value.strip():
-        if not template.allow_custom:
+        if not template.allow_custom and not (intent.type == "custom" and template.type == "boolean" and intent.custom_value.strip().casefold() in _BOOLEAN_VALUES):
             raise ValueError(f"Custom answers are not allowed for {intent.question_id}")
         value = intent.custom_value.strip()
         source = "USER_CUSTOM"

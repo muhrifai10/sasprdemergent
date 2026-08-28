@@ -10,6 +10,7 @@ const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Projects = lazy(() => import("./pages/Projects"));
 const NewProject = lazy(() => import("./pages/NewProject"));
 const ProjectDetail = lazy(() => import("./pages/ProjectDetail"));
+const GuidedDiscoveryPage = lazy(() => import("./pages/GuidedDiscoveryPage"));
 const Admin = lazy(() => import("./pages/Admin"));
 const SharePage = lazy(() => import("./pages/SharePage"));
 const Upgrade = lazy(() => import("./pages/Upgrade"));
@@ -50,7 +51,8 @@ function AppRouter() {
         <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
         <Route path="/projects" element={<ProtectedRoute><Projects /></ProtectedRoute>} />
         <Route path="/projects/new" element={<ProtectedRoute><NewProject /></ProtectedRoute>} />
-        <Route path="/projects/:id" element={<ProtectedRoute><ProjectDetail /></ProtectedRoute>} />
+         <Route path="/projects/:id" element={<ProtectedRoute><ProjectDetail /></ProtectedRoute>} />
+         <Route path="/projects/:id/discovery" element={<ProtectedRoute><GuidedDiscoveryPage /></ProtectedRoute>} />
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="/upgrade" element={<ProtectedRoute><Upgrade /></ProtectedRoute>} />
         <Route path="/share/:shareId" element={<SharePage />} />

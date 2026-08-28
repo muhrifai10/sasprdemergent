@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import AppLayout from "../components/AppLayout";
-import { api } from "../lib/api";
+import { api, createGuidedProject, normalizeApiError } from "../lib/api";
 import { useLang } from "../context/LanguageContext";
 import { toast } from "sonner";
 import { ArrowRight, Loader2, Cloud, Store, Smartphone, ShoppingCart, Sparkles, Wrench, FilePlus } from "lucide-react";
@@ -40,6 +40,8 @@ const t = {
     tplBlank: "Kosong",
     tplBlankSub: "Mulai dari nol",
     tplApplied: "Template diterapkan",
+    guided: "Gunakan Guided Discovery",
+    guidedSub: "AI membantu menemukan gap; keputusan tetap milik Anda.",
   },
   en: {
     title: "Create New Project",
@@ -72,6 +74,8 @@ const t = {
     tplBlank: "Blank",
     tplBlankSub: "Start from scratch",
     tplApplied: "Template applied",
+    guided: "Use Guided Discovery",
+    guidedSub: "AI helps find gaps; decisions remain yours.",
   },
 };
 
@@ -84,6 +88,7 @@ export default function NewProject() {
   const [showOptional, setShowOptional] = useState(false);
   const [templates, setTemplates] = useState([]);
   const [selectedTpl, setSelectedTpl] = useState(null);
+  const [guided, setGuided] = useState(false);
 
   const loadTemplates = useCallback(() => {
     api.get("/templates").then((r) => setTemplates(r.data)).catch(() => setTemplates([]));
@@ -113,11 +118,11 @@ export default function NewProject() {
     if (!form.name.trim()) { toast.error(c.nameRequired); return; }
     setSaving(true);
     try {
-      const res = await api.post("/projects", form);
+      const res = guided ? await createGuidedProject(form) : await api.post("/projects", form);
       toast.success(c.created);
-      navigate(`/projects/${res.data.id}`);
+      navigate(guided ? `/projects/${res.data.id}/discovery` : `/projects/${res.data.id}`);
     } catch (err) {
-      toast.error(err.response?.data?.detail || "Failed to create project");
+      toast.error(guided ? normalizeApiError(err) : err.response?.data?.detail || "Failed to create project");
       setSaving(false);
     }
   };
@@ -182,6 +187,14 @@ export default function NewProject() {
               ))}
             </div>
           )}
+
+          <label className="flex items-start gap-3 border border-white/10 bg-[#121212] px-4 py-3 text-sm" data-testid="guided-mode-control">
+            <input type="checkbox" checked={guided} onChange={(e) => setGuided(e.target.checked)} className="mt-1 h-4 w-4 accent-indigo-500" data-testid="guided-mode-toggle" />
+            <span>
+              <span className="block font-semibold">{c.guided}</span>
+              <span className="mt-1 block text-xs text-zinc-500">{c.guidedSub}</span>
+            </span>
+          </label>
 
           <button type="submit" disabled={saving}
             className="btn-primary group px-7 py-3.5 rounded-full font-semibold text-sm flex items-center gap-2 disabled:opacity-60" data-testid="project-submit-btn">
