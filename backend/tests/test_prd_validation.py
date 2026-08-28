@@ -1993,6 +1993,36 @@ def test_d03_parse_valid_analysis():
     assert a.questions[0].category == "desired_features"
 
 
+def test_d03_understanding_must_be_object():
+    raw = json.dumps(_analysis_json(questions=[]))
+    assert isinstance(server.parse_discovery_analysis(raw).understanding, dict)
+    with pytest.raises(Exception):
+        server.parse_discovery_analysis(raw.replace('"understanding": {}', '"understanding": "free form"'))
+
+
+def test_d03_prompt_requires_object_understanding():
+    prompt = server.discovery_analyzer_prompt({"name": "POS", "description": "retail cashier", "discovery": {}})
+    assert '"understanding" MUST be a JSON object, never a string' in prompt
+
+
+def test_d03_question_schema_alias_is_normalized():
+    analysis = server.DiscoveryAnalysis(questions=[server.DiscoveryQuestionOut(
+        question="Pilih pengguna", type="single-select", options=["Owner", "Kasir"],
+        required=True, category="target_users", reason="scope", impact="HIGH", dependency=None,
+    )])
+    validated = server._validate_discovery_analysis(analysis)
+    assert validated.questions[0].type == "single_choice"
+    assert validated.questions[0].options == ["Owner", "Kasir"]
+
+
+def test_d03_invalid_question_type_rejected():
+    analysis = server.DiscoveryAnalysis(questions=[server.DiscoveryQuestionOut(
+        question="Pilih pengguna", type="dropdown", category="target_users", impact="HIGH",
+    )])
+    with pytest.raises(ValueError, match="invalid discovery question type"):
+        server._validate_discovery_analysis(analysis)
+
+
 def test_d03_parse_invalid_analysis():
     with pytest.raises(Exception):
         server.parse_discovery_analysis("not json")
@@ -2030,7 +2060,7 @@ def test_d03_unknown_allows_followup():
         questions=[{"id": "q_x", "category": "target_users"}],
         answers={"q_x": {"value": "", "status": "UNKNOWN"}},
     )
-    q = [server.DiscoveryQuestionOut(question="Target?", category="target_users")]
+    q = [server.DiscoveryQuestionOut(question="Siapa pengguna utama?", category="target_users")]
     assert len(server.materialize_discovery_questions(q, disc)) == 1
 
 
@@ -2135,7 +2165,7 @@ def test_d03_fallback_same_context(monkeypatch):
     async def fake_attempts():
         return [("A", "m", "k", "u"), ("B", "m", "k", "u")]
     monkeypatch.setattr(server, "build_ai_attempts", fake_attempts)
-    p = {"name": "X", "description": "idea", "discovery": {"questions": [], "answers": {}}}
+    p = {"name": "X", "description": "idea", "target_users": "teams", "desired_features": "task", "discovery": {"questions": [], "answers": {}}}
     r = asyncio.run(server._ai_analyze_discovery(p))
     assert len(r.questions) == 1
     assert len(prompts) >= 3 and prompts[0] == prompts[-1]  # same context for fallback
@@ -2161,6 +2191,87 @@ def _analysis_json(*, questions=None, missing=None, ambiguities=None):
     }
 
 
+def test_d032_target_users_gap_requires_target_users_question():
+    roles = server.DiscoveryQuestionOut(question="Role apa?", category="roles_permissions")
+    assert not server.questions_cover_gaps([roles], ["target_users"])
+    target = server.DiscoveryQuestionOut(question="Siapa pengguna?", category="target_users")
+    assert server.questions_cover_gaps([target], ["target_users"])
+
+
+@pytest.mark.parametrize(("question_category", "gap"), [
+    ("workflow", "workflow"),
+    ("payment_requirement", "payment"),
+    ("inventory", "inventory"),
+])
+def test_d032_question_category_covers_matching_gap(question_category, gap):
+    question = server.DiscoveryQuestionOut(question=f"Detail {question_category}?", category=question_category)
+    assert server.questions_cover_gaps([question], [gap])
+
+
+def test_d032_blocking_gaps_reduce_after_answers():
+    project = {"name": "X", "description": "team tool", "discovery": {
+        "questions": [
+            {"id": "q_target", "category": "target_users"},
+            {"id": "q_features", "category": "desired_features"},
+        ],
+        "answers": {},
+    }}
+    before = server.blocking_discovery_categories(project)
+    project["discovery"]["answers"] = {
+        "q_target": {"value": "teams", "status": "CONFIRMED"},
+        "q_features": {"value": "tasks", "status": "CONFIRMED"},
+    }
+    after = server.blocking_discovery_categories(project)
+    assert len(after) < len(before)
+
+
+def test_d032_question_batch_over_budget_rejected():
+    analysis = server.DiscoveryAnalysis(questions=[
+        server.DiscoveryQuestionOut(question=f"Question {i}?", category="target_users") for i in range(7)
+    ])
+    with pytest.raises(ValueError, match="too many discovery questions"):
+        server._validate_discovery_analysis(analysis)
+
+
+def test_d032_semantic_duplicate_rejected():
+    analysis = server.DiscoveryAnalysis(questions=[
+        server.DiscoveryQuestionOut(question="Siapa pengguna sistem?", category="target_users"),
+        server.DiscoveryQuestionOut(question="Siapa saja pengguna aplikasi?", category="target_users"),
+    ])
+    with pytest.raises(ValueError, match="semantically duplicate"):
+        server._validate_discovery_analysis(analysis)
+
+
+def test_d032_zero_questions_cannot_cover_gap():
+    assert not server.questions_cover_gaps([], ["target_users"])
+    assert server.questions_cover_gaps([], [])
+
+
+def test_d032_pos_initial_gaps_include_target_users():
+    project = {"name": "POS", "description": "aplikasi kasir untuk toko retail", "discovery": {"questions": [], "answers": {}}}
+    assert "target_users" in server.blocking_discovery_categories(project)
+
+
+def test_d032_round_limit_returns_needs_clarification(monkeypatch):
+    store = _seed(monkeypatch, {"p1": {"id": "p1", "user_id": "u1", "name": "X", "description": "idea",
+                                       "discovery_status": "in_progress", "discovery": {"questions": [], "answers": {},
+                                                                                         "analysis_rounds": server.MAX_DISCOVERY_ROUNDS}}})
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.discovery_analyze("p1", {"user_id": "u1"}))
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "NEEDS_CLARIFICATION"
+
+
+def test_d032_stalled_gaps_return_needs_clarification(monkeypatch):
+    _seed(monkeypatch, {"p1": {"id": "p1", "user_id": "u1", "name": "X", "description": "idea",
+                               "discovery_status": "in_progress", "discovery": {"questions": [], "answers": {},
+                                                                                     "stalled_rounds": 2}}})
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(server.discovery_analyze("p1", {"user_id": "u1"}))
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "NEEDS_CLARIFICATION"
+
+
 def _fake_discovery_stream(monkeypatch, responses, attempts=None):
     calls = []
 
@@ -2184,7 +2295,7 @@ async def _one_attempt():
 def test_d031_normal_ai_response_parsed(monkeypatch):
     q = {"question": "Siapa pengguna?", "category": "target_users", "impact": "HIGH"}
     calls = _fake_discovery_stream(monkeypatch, [json.dumps(_analysis_json(questions=[q]))])
-    result = asyncio.run(server._ai_analyze_discovery({"description": "idea", "discovery": {"questions": [], "answers": {}}}))
+    result = asyncio.run(server._ai_analyze_discovery({"description": "idea", "target_users": "teams", "desired_features": "task", "discovery": {"questions": [], "answers": {}}}))
     assert result.questions[0].category == "target_users"
     assert calls[0]["response_format"] == server.DISCOVERY_JSON_FORMAT
 
@@ -2256,7 +2367,7 @@ def test_d031_empty_response_rejected(monkeypatch):
 def test_d031_malformed_json_retries(monkeypatch):
     valid = json.dumps(_analysis_json(questions=[{"question": "Target?", "category": "target_users"}]))
     calls = _fake_discovery_stream(monkeypatch, ["{broken", valid])
-    result = asyncio.run(server._ai_analyze_discovery({"description": "idea", "discovery": {"questions": [], "answers": {}}}))
+    result = asyncio.run(server._ai_analyze_discovery({"description": "idea", "target_users": "teams", "desired_features": "task", "discovery": {"questions": [], "answers": {}}}))
     assert len(result.questions) == 1
     assert len(calls) == 2
 
@@ -2265,7 +2376,7 @@ def test_d031_invalid_schema_retries(monkeypatch):
     invalid = json.dumps(_analysis_json(questions=[{"category": "target_users"}]))
     valid = json.dumps(_analysis_json(questions=[{"question": "Target?", "category": "target_users"}]))
     calls = _fake_discovery_stream(monkeypatch, [invalid, valid])
-    result = asyncio.run(server._ai_analyze_discovery({"description": "idea", "discovery": {"questions": [], "answers": {}}}))
+    result = asyncio.run(server._ai_analyze_discovery({"description": "idea", "target_users": "teams", "desired_features": "task", "discovery": {"questions": [], "answers": {}}}))
     assert len(result.questions) == 1
     assert len(calls) == 2
 
@@ -2277,7 +2388,7 @@ def test_d031_fallback_returns_valid_analysis(monkeypatch):
                                        ("primary", "bad-model", "key", "https://primary.test/v1"),
                                        ("fallback", "good-model", "key", "https://fallback.test/v1"),
                                    ]))
-    result = asyncio.run(server._ai_analyze_discovery({"description": "idea", "discovery": {"questions": [], "answers": {}}}))
+    result = asyncio.run(server._ai_analyze_discovery({"description": "idea", "target_users": "teams", "desired_features": "task", "discovery": {"questions": [], "answers": {}}}))
     assert result.questions[0].category == "target_users"
     assert calls[-1]["provider"] == "fallback"
 
