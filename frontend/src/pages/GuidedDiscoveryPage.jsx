@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { AlertTriangle, Check, CircleHelp, Loader2, RefreshCw, Sparkles, X } from "lucide-react";
 import AppLayout from "../components/AppLayout";
 import { Badge } from "../components/ui/badge";
@@ -7,6 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../co
 import { Skeleton } from "../components/ui/skeleton";
 import {
   api,
+  confirmDiscovery,
   getDiscovery,
   getDiscoveryReview,
   getRecommendations,
@@ -59,6 +60,9 @@ const t = {
     reviewAgain: "Periksa lagi",
     readyForConfirmation: "Siap untuk konfirmasi",
     confirmationNext: "Konfirmasi tersedia pada tahap berikutnya.",
+    confirm: "Konfirmasi discovery",
+    confirming: "Mengonfirmasi...",
+    generatePrd: "Generate PRD",
     unknownSection: "Belum ditentukan",
     notRequiredSection: "Tidak diperlukan",
     summary: "Ringkasan produk",
@@ -131,6 +135,9 @@ const t = {
     reviewAgain: "Check again",
     readyForConfirmation: "Ready for confirmation",
     confirmationNext: "Confirmation is available in the next stage.",
+    confirm: "Confirm discovery",
+    confirming: "Confirming...",
+    generatePrd: "Generate PRD",
     unknownSection: "Not determined",
     notRequiredSection: "Not required",
     summary: "Product summary",
@@ -343,7 +350,7 @@ function ReviewDecisionList({ decisions, questionCatalog, copy, onEdit, canEdit,
   return <div className="space-y-2">{decisions.map((decision) => { const label = reviewDecisionLabel(decision, questionCatalog, copy); return <div key={`${decision.question_id}-${decision.status}`} className="border border-white/10 bg-black/10 p-4" data-testid={`review-decision-${decision.question_id}`}><div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between"><div><p className="text-[10px] font-mono uppercase tracking-widest text-indigo-300">{label.category}</p><p className="mt-1 text-sm font-semibold text-white">{label.question}</p><p className="mt-2 text-sm text-zinc-300">{decision.status === "CONFIRMED" ? decision.value || copy.confirmedState : decision.status === "UNKNOWN" ? copy.unknownState : copy.notRequiredState}</p>{decision.status === "CONFIRMED" && <p className="mt-2 text-xs text-zinc-500">{label.source}</p>}</div>{canEdit && <button type="button" onClick={() => onEdit(decision.question_id)} className="min-h-11 shrink-0 border border-white/15 px-4 text-xs font-semibold text-zinc-300 transition-colors hover:border-indigo-400/50 hover:text-white" data-testid={`review-edit-${decision.question_id}`}>{copy.edit}</button>}</div></div>; })}</div>;
 }
 
-export function ReviewPanel({ review, reviewLoading, reviewError, questionCatalog, copy, onRefresh, onEdit }) {
+export function ReviewPanel({ review, reviewLoading, reviewError, questionCatalog, copy, onRefresh, onEdit, onConfirm, confirmationState, onGenerate }) {
   if (reviewLoading && !review) return <section className="mt-10 space-y-4" data-testid="review-loading-state" aria-live="polite"><Skeleton className="h-10 w-48 bg-white/10" /><Skeleton className="h-56 w-full bg-white/10" /></section>;
   if (reviewError && !review) return <section className="mt-10 border border-red-500/30 bg-red-500/5 p-5" data-testid="review-error-state" role="alert" aria-live="assertive"><p className="text-sm text-red-200">{reviewError}</p><button type="button" onClick={onRefresh} className="btn-primary mt-4 min-h-11 px-4 text-sm font-semibold" data-testid="review-retry-btn"><RefreshCw size={14} className="mr-2 inline" />{copy.reviewAgain}</button></section>;
   if (!review) return null;
@@ -359,6 +366,7 @@ export function ReviewPanel({ review, reviewLoading, reviewError, questionCatalo
   const conditionalGaps = completeness.conditional_missing || [];
   const unknownBlocking = completeness.unknown || [];
   const summary = data.summary || {};
+  const confirmedState = data.confirmation_state?.status === "confirmed";
 
   return <section className="mt-10 space-y-5" data-testid="review-panel" aria-live="polite">
     <div className="flex flex-col gap-4 border-b border-white/10 pb-5 sm:flex-row sm:items-end sm:justify-between"><div><p className="font-mono text-[10px] uppercase tracking-[0.25em] text-indigo-300">{copy.review}</p><h2 className="mt-2 text-2xl font-black tracking-tight text-white">{copy.summary}</h2><p className="mt-1 text-sm text-zinc-500">{copy.reviewSub}</p></div><button type="button" onClick={onRefresh} disabled={reviewLoading} className="min-h-11 border border-white/15 px-4 text-xs font-semibold text-zinc-300 transition-colors hover:border-indigo-400/50 hover:text-white disabled:opacity-50" data-testid="review-refresh-btn" aria-busy={reviewLoading}><RefreshCw size={14} className={`mr-2 inline ${reviewLoading ? "animate-spin" : ""}`} />{copy.reviewAgain}</button></div>
@@ -370,7 +378,7 @@ export function ReviewPanel({ review, reviewLoading, reviewError, questionCatalo
     <details open className="border border-amber-500/20 bg-[#121212] p-4" data-testid="review-unknown"><summary className="cursor-pointer text-sm font-semibold text-amber-200">{copy.unknownSection} ({unknown.length})</summary><div className="mt-4"><ReviewDecisionList decisions={unknown} questionCatalog={questionCatalog} copy={copy} onEdit={onEdit} canEdit={review.can_edit} emptyText={copy.noItems} /></div></details>
     <details open className="border border-sky-500/20 bg-[#121212] p-4" data-testid="review-not-required"><summary className="cursor-pointer text-sm font-semibold text-sky-200">{copy.notRequiredSection} ({notRequired.length})</summary><div className="mt-4"><ReviewDecisionList decisions={notRequired} questionCatalog={questionCatalog} copy={copy} onEdit={onEdit} canEdit={review.can_edit} emptyText={copy.noItems} /></div></details>
     <details className="border border-white/10 bg-[#121212] p-4" data-testid="review-history"><summary className="cursor-pointer text-sm font-semibold text-zinc-300">{copy.history} ({(data.decision_history || []).length})</summary><div className="mt-4 space-y-2">{(data.decision_history || []).map((decision) => <div key={`${decision.question_id}-${decision.decided_at}`} className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-2 text-xs text-zinc-400"><span>{decision.question_id}</span><span>{decision.status}{decision.value ? ` · ${decision.value}` : ""}</span></div>)}</div></details>
-    <div className="flex flex-col gap-3 border-t border-white/10 pt-5 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs text-zinc-500">Catalog {review.catalog_version || "—"}</p><button type="button" disabled aria-disabled="true" className="min-h-11 border border-white/10 px-5 text-sm font-semibold text-zinc-500 disabled:cursor-not-allowed" data-testid="review-confirm-action">{copy.readyForConfirmation}<span className="ml-2 text-[10px] font-normal">{copy.confirmationNext}</span></button></div>
+     <div className="flex flex-col gap-3 border-t border-white/10 pt-5 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs text-zinc-500">Catalog {review.catalog_version || "—"}</p>{confirmedState ? <button type="button" onClick={onGenerate} className="btn-primary flex min-h-11 items-center justify-center gap-2 px-5 text-sm font-semibold" data-testid="review-generate-prd-btn"><Sparkles size={15} />{copy.generatePrd}</button> : <button type="button" onClick={onConfirm} disabled={!review.can_confirm || confirmationState === "confirming"} className="btn-primary flex min-h-11 items-center justify-center gap-2 px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50" data-testid="review-confirm-action" aria-busy={confirmationState === "confirming"}>{confirmationState === "confirming" ? <><Loader2 size={15} className="animate-spin" />{copy.confirming}</> : <>{copy.confirm}<span className="ml-2 text-[10px] font-normal opacity-70">{copy.readyForConfirmation}</span></>}</button>}</div>
   </section>;
 }
 
@@ -388,6 +396,7 @@ function ProgressItem({ label, value }) {
 
 export default function GuidedDiscoveryPage() {
   const { id } = useParams();
+  const navigate = useNavigate();
   const { lang } = useLang();
   const copy = t[lang];
   const [project, setProject] = useState(null);
@@ -402,6 +411,7 @@ export default function GuidedDiscoveryPage() {
   const [editingIds, setEditingIds] = useState({});
   const [requestState, setRequestState] = useState("loading");
   const [submissionState, setSubmissionState] = useState("idle");
+  const [confirmationState, setConfirmationState] = useState("idle");
   const [error, setError] = useState(null);
   const questionCatalogRef = useRef({});
   const submissionRef = useRef(false);
@@ -521,6 +531,20 @@ export default function GuidedDiscoveryPage() {
     }
   };
 
+  const confirmReview = async () => {
+    if (!review?.can_confirm || confirmationState === "confirming") return;
+    setConfirmationState("confirming");
+    setError(null);
+    try {
+      await confirmDiscovery(id);
+      await refreshDiscovery();
+    } catch (err) {
+      setError(normalizeApiError(err));
+    } finally {
+      setConfirmationState("idle");
+    }
+  };
+
   const setDraft = (questionId, intent) => {
     setDraftDecisions((current) => ({ ...current, [questionId]: intent }));
   };
@@ -617,7 +641,7 @@ export default function GuidedDiscoveryPage() {
           {(discovery?.discovery_status === "none" || (requestState === "error" && questions.length === 0 && decisions.length === 0)) && <button type="button" onClick={analyze} disabled={requestState === "analyzing" || submissionState === "submitting"} className="btn-primary mt-6 flex min-h-11 items-center gap-2 px-6 py-3 text-sm font-semibold disabled:opacity-50" data-testid="guided-analyze-btn" aria-busy={requestState === "analyzing"}>{requestState === "analyzing" ? <><Loader2 size={15} className="animate-spin" />{copy.analyzing}</> : <><Sparkles size={15} />{copy.analyze}</>}</button>}
           {requestState === "analyzing" && <div className="mt-8" data-testid="guided-analyzing-state"><LoadingState copy={copy} /></div>}
           {questions.length > 0 && <section className="mt-8 space-y-4" aria-label="Discovery questions" data-testid="guided-question-list">{questions.map((question) => <QuestionCard key={questionIdOf(question)} question={question} copy={copy} draft={draftDecisions[questionIdOf(question)]} serverDecision={authoritativeDecision(questionIdOf(question))} submitting={submissionState === "submitting"} editing={Boolean(editingIds[questionIdOf(question)])} validationError={validationErrors[questionIdOf(question)]} onDraft={(intent) => setDraft(questionIdOf(question), intent)} onEdit={editDecision} onCancelEdit={cancelEdit} />)}</section>}
-          {(review || reviewLoading || reviewError) && <ReviewPanel review={review} reviewLoading={reviewLoading} reviewError={reviewError} questionCatalog={questionCatalog} copy={copy} onRefresh={() => loadReview(discovery?.discovery_status)} onEdit={editDecision} />}
+           {(review || reviewLoading || reviewError) && <ReviewPanel review={review} reviewLoading={reviewLoading} reviewError={reviewError} questionCatalog={questionCatalog} copy={copy} onRefresh={() => loadReview(discovery?.discovery_status)} onEdit={editDecision} onConfirm={confirmReview} confirmationState={confirmationState} onGenerate={() => navigate(`/projects/${id}`)} />}
           {resolvedQuestions.length > 0 && <section className="mt-10 space-y-4" aria-label="Server decisions" data-testid="guided-resolved-list"><div><p className="font-mono text-[10px] uppercase tracking-widest text-zinc-600">Server decisions</p><p className="mt-1 text-xs text-zinc-500">Nilai dan status di bawah berasal dari response backend.</p></div>{resolvedQuestions.map((question) => { const questionId = questionIdOf(question); return <QuestionCard key={`resolved-${questionId}`} question={{ ...question, value: authoritativeDecision(questionId)?.value }} copy={copy} draft={draftDecisions[questionId]} serverDecision={authoritativeDecision(questionId)} submitting={submissionState === "submitting"} editing={Boolean(editingIds[questionId])} validationError={validationErrors[questionId]} onDraft={(intent) => setDraft(questionId, intent)} onEdit={editDecision} onCancelEdit={cancelEdit} />; })}</section>}
           {gaps.length > 0 && <section className="mt-8 border border-amber-500/20 bg-amber-500/5 p-5" data-testid="guided-blocking-gaps"><h2 className="text-xs font-mono uppercase tracking-widest text-amber-300">{copy.gaps}</h2><ul className="mt-3 space-y-1 text-sm text-zinc-300">{gaps.map((gap) => <li key={gap}>• {gap}</li>)}</ul></section>}
           {questions.length === 0 && requestState === "success" && discovery?.discovery_status !== "none" && discovery?.discovery_status !== "confirmed" && <div className="mt-8 border border-dashed border-white/15 p-8 text-sm text-zinc-500" data-testid="guided-empty-questions">{copy.noQuestions}</div>}

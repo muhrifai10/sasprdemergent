@@ -3,6 +3,7 @@
 import axios from "axios";
 import {
   createGuidedProject,
+  confirmDiscovery,
   getDiscovery,
   getRecommendations,
   guidedAnalyze,
@@ -23,11 +24,13 @@ test("guided API helpers use the backend discovery contract", () => {
   guidedAnalyze("project-1");
   getDiscovery("project-1");
   getRecommendations("project-1", "q_auth");
+  confirmDiscovery("project-1");
 
   expect(client.post).toHaveBeenNthCalledWith(1, "/projects", { name: "Test", discovery_mode: "guided_discovery" });
   expect(client.post).toHaveBeenNthCalledWith(2, "/projects/project-1/discovery/analyze", {}, {});
   expect(client.get).toHaveBeenNthCalledWith(1, "/projects/project-1/discovery", {});
   expect(client.get).toHaveBeenNthCalledWith(2, "/projects/project-1/discovery/recommendations", { params: { question_id: "q_auth" } });
+  expect(client.post).toHaveBeenNthCalledWith(3, "/projects/project-1/discovery/confirm");
 });
 
 test("API errors are normalized without exposing unsafe details", () => {

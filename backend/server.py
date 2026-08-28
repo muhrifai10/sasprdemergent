@@ -1932,6 +1932,18 @@ def _snapshot_discovery_answers(project: dict) -> dict:
     return snapshot
 
 
+def _redact_snapshot_value(value, secrets: list[str]):
+    if isinstance(value, dict):
+        return {key: _redact_snapshot_value(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_snapshot_value(item, secrets) for item in value]
+    if isinstance(value, str):
+        for secret in secrets:
+            if secret:
+                value = value.replace(secret, "[REDACTED]")
+    return value
+
+
 async def _load_owned_project(project_id: str, user: dict) -> dict:
     p = await db.projects.find_one({"id": project_id, "user_id": user["user_id"]}, {"_id": 0})
     if not p:
@@ -2204,7 +2216,14 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
     project = await _load_owned_project(project_id, user)
     status = project.get("discovery_status")
     if status == "confirmed":
-        return {"discovery_status": "confirmed", "confirmed_at": _discovery(project).get("confirmed_at")}
+        snapshot = _discovery(project).get("confirmation_snapshot") or {}
+        return {
+            "discovery_status": "confirmed",
+            "confirmed_at": _discovery(project).get("confirmed_at"),
+            "confirmed_by": snapshot.get("confirmed_by"),
+            "canonical_spec": deepcopy(snapshot.get("canonical_spec")),
+            "confirmation_snapshot": deepcopy(snapshot),
+        }
     if status != "awaiting_confirmation":
         raise HTTPException(status_code=409, detail=f"Discovery belum siap dikonfirmasi (status: {status}). Lengkapi jawaban terlebih dahulu.")
     check = completeness_check(project)
@@ -2226,6 +2245,13 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
     disc["confirmed_at"] = datetime.now(timezone.utc).isoformat()
     understanding = build_product_understanding(project)
     disc["summary"] = understanding
+    answers = effective_answers(_discovery(project))
+    secret_values = [
+        str(answer.get("value"))
+        for question in _discovery_questions(project)
+        for answer in [answers.get(question.get("id")) or {}]
+        if answer.get("value") and any(term in str(question.get("question") or "").lower() for term in _SECRET_TERMS)
+    ]
     snapshot = {
         "answers": _snapshot_discovery_answers(project),
         "summary": deepcopy(understanding),
@@ -2237,11 +2263,14 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
         },
         "completeness": deepcopy(check),
         "original_project_fields": original_project_fields,
+        "canonical_spec": spec.model_dump(),
+        "confirmed_by": user["user_id"],
         "status": "confirmed",
         "confirmed_at": disc["confirmed_at"],
     }
     if "decisions" in _discovery(project):
         snapshot.update(decision_snapshot(_discovery(project)))
+    snapshot = _redact_snapshot_value(snapshot, secret_values)
     snapshots = list(disc.get("confirmation_snapshots") or [])
     snapshots.append(snapshot)
     disc["confirmation_snapshots"] = snapshots
@@ -2249,7 +2278,14 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
     updates["discovery_status"] = "confirmed"
     updates["discovery"] = disc
     await db.projects.update_one({"id": project_id, "user_id": user["user_id"]}, {"$set": updates})
-    return {"discovery_status": "confirmed", "confirmed_at": disc["confirmed_at"], "summary": disc["summary"]}
+    return {
+        "discovery_status": "confirmed",
+        "confirmed_at": disc["confirmed_at"],
+        "confirmed_by": user["user_id"],
+        "summary": disc["summary"],
+        "canonical_spec": deepcopy(snapshot["canonical_spec"]),
+        "confirmation_snapshot": deepcopy(snapshot),
+    }
 
 
 @api_router.post("/projects")

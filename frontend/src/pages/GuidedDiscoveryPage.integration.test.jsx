@@ -1,6 +1,7 @@
 /* global afterEach, expect, jest, test */
 
-jest.mock("react-router-dom", () => ({ useParams: () => ({ id: "project-1" }) }), { virtual: true });
+const mockNavigate = jest.fn();
+jest.mock("react-router-dom", () => ({ useParams: () => ({ id: "project-1" }), useNavigate: () => mockNavigate }), { virtual: true });
 jest.mock("../context/LanguageContext", () => ({ useLang: () => ({ lang: "en" }) }));
 jest.mock("../components/AppLayout", () => ({ __esModule: true, default: ({ children }) => children }));
 jest.mock("../components/ui/badge", () => ({ Badge: ({ children, ...props }) => <div {...props}>{children}</div> }));
@@ -17,6 +18,7 @@ jest.mock("../lib/api", () => ({
   api: { get: jest.fn() },
   getDiscovery: jest.fn(),
   getDiscoveryReview: jest.fn(),
+  confirmDiscovery: jest.fn(),
   getRecommendations: jest.fn(),
   guidedAnalyze: jest.fn(),
   submitGuidedDecisions: jest.fn(),
@@ -33,6 +35,7 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const mockApiGet = apiModule.api.get;
 const mockGetDiscovery = apiModule.getDiscovery;
 const mockGetDiscoveryReview = apiModule.getDiscoveryReview;
+const mockConfirmDiscovery = apiModule.confirmDiscovery;
 const mockGetRecommendations = apiModule.getRecommendations;
 const mockSubmitGuidedDecisions = apiModule.submitGuidedDecisions;
 
@@ -73,10 +76,10 @@ function snapshot({ activeIds = ["database.selection"], questions = [currentQues
   };
 }
 
-async function mountPage(discovery = snapshot()) {
+async function mountPage(discovery = snapshot(), review = reviewSnapshot()) {
   mockApiGet.mockResolvedValue({ data: { id: "project-1", name: "Test project", description: "An idea" } });
   mockGetDiscovery.mockResolvedValue(discovery);
-  mockGetDiscoveryReview.mockResolvedValue({ data: reviewSnapshot() });
+  mockGetDiscoveryReview.mockResolvedValue(review);
   mockGetRecommendations.mockResolvedValue({ data: { recommendations: [{ id: "database.selection.postgresql", value: "PostgreSQL", label: "PostgreSQL", reason: "Safe default", tradeoffs: [] }] } });
   const container = document.createElement("div");
   const root = createRoot(container);
@@ -176,7 +179,26 @@ test("review renders backend readiness, confirmed provenance, and blocking gaps"
   expect(container.querySelector('[data-testid="review-readiness"]').textContent).toContain("Ready for review");
   expect(container.querySelector('[data-testid="review-decision-database.selection"]').textContent).toContain("Recommendation selected");
   expect(container.querySelector('[data-testid="review-blocking-gaps"]').textContent).toContain("No items.");
-  expect(container.querySelector('[data-testid="review-confirm-action"]').disabled).toBe(true);
+  expect(container.querySelector('[data-testid="review-confirm-action"]').disabled).toBe(false);
+  expect(container.querySelector('[data-testid="review-generate-prd-btn"]')).toBeNull();
+});
+
+test("confirmation uses the backend gate and exposes generation only after confirmation", async () => {
+  const container = await mountPage(snapshot({ activeIds: [], questions: [], status: "awaiting_confirmation", readiness: "ready_for_review", gaps: [] }), reviewSnapshot({ readiness: "ready_for_review", blockingGaps: [] }));
+  mockConfirmDiscovery.mockResolvedValue({ data: { discovery_status: "confirmed" } });
+  mockGetDiscovery.mockResolvedValue(snapshot({ activeIds: [], questions: [], status: "confirmed", readiness: "ready_for_review", gaps: [] }));
+  const confirmedReview = reviewSnapshot({ readiness: "ready_for_review", blockingGaps: [] });
+  confirmedReview.data.review.confirmation_state = { status: "confirmed" };
+  mockGetDiscoveryReview.mockResolvedValue(confirmedReview);
+
+  expect(container.querySelector('[data-testid="review-confirm-action"]').disabled).toBe(false);
+  act(() => container.querySelector('[data-testid="review-confirm-action"]').click());
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+
+  expect(mockConfirmDiscovery).toHaveBeenCalledWith("project-1");
+  expect(container.querySelector('[data-testid="review-generate-prd-btn"]')).toBeTruthy();
+  act(() => container.querySelector('[data-testid="review-generate-prd-btn"]').click());
+  expect(mockNavigate).toHaveBeenCalledWith("/projects/project-1");
 });
 
 test("review separates unknown and not-required decisions without treating them as missing", async () => {

@@ -1939,6 +1939,19 @@ def test_d02_confirm_succeeds_and_maps(monkeypatch):
     assert p["discovery_status"] == "confirmed"
     assert p["discovery"]["confirmed_at"] is not None
     assert p["preferred_technology"] == "Next.js + PostgreSQL"
+    snapshot = p["discovery"]["confirmation_snapshot"]
+    assert snapshot["canonical_spec"]["technology"] == "Next.js + PostgreSQL"
+    assert snapshot["confirmed_by"] == "u1"
+    assert r["confirmation_snapshot"] == snapshot
+
+
+def test_d02_confirm_is_idempotent_and_does_not_replace_snapshot(monkeypatch):
+    store = _confirm_project(monkeypatch)
+    first = asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    snapshot = store["projects"]["p1"]["discovery"]["confirmation_snapshot"]
+    second = asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    assert store["projects"]["p1"]["discovery"]["confirmation_snapshot"] == snapshot
+    assert second["confirmation_snapshot"] == first["confirmation_snapshot"]
 
 
 def test_d02_confirm_does_not_start_generation(monkeypatch):
