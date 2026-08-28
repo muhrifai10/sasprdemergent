@@ -432,6 +432,10 @@ _INFRA_RE = re.compile(r"\b(vercel|heroku|railway|render|ecs|aws|gcp|google clou
 _STOR_RE = re.compile(r"\b(s3|cloudinary|amazon s3|aws s3|supabase storage|firebase storage)\b", re.IGNORECASE)
 _TECH_RE = re.compile(r"\b(laravel|next\.?js|react|node|django|fastapi|flask|spring boot|express|nuxt)\b", re.IGNORECASE)
 _HASH_RE = re.compile(r"\b(argon2id|argon2|bcrypt|bycrypt|pbkdf2|scrypt)\b", re.IGNORECASE)
+_AUTH_IMPLEMENTATION_RE = re.compile(
+    r"\b(nextauth|next-auth|jwt|oauth|session cookie|session technology|bcrypt|argon2|password hash)\b",
+    re.IGNORECASE,
+)
 
 _DB_CANON = {"postgres": "PostgreSQL", "postgresql": "PostgreSQL", "mysql": "MySQL",
              "mariadb": "MariaDB", "mongodb": "MongoDB", "sqlite": "SQLite",
@@ -458,6 +462,72 @@ def _collect(pattern: re.Pattern, text: str) -> list[str]:
 
 def _canonical(pattern: re.Pattern, text: str, mapping: dict) -> str:
     return ", ".join(dict.fromkeys(mapping.get(m.lower(), m) for m in _collect(pattern, text)))
+
+
+def canonical_authority(spec: CanonicalProductSpec) -> dict:
+    """Return the structured authority state used by every downstream generator."""
+    provenance = spec.field_provenance or {}
+
+    def item(field: str, value: str = "", status: str | None = None) -> dict:
+        source = provenance.get(field, {})
+        resolved_status = status or source.get("status") or ("CONFIRMED" if value else "UNKNOWN")
+        resolved_value = value or source.get("value") or ""
+        if resolved_status == "NOT_REQUIRED":
+            resolved_value = "NOT_REQUIRED"
+        return {
+            "value": resolved_value,
+            "status": resolved_status,
+            "source": source.get("source", "UNKNOWN"),
+            "source_id": source.get("source_id"),
+        }
+
+    auth_impl = _AUTH_IMPLEMENTATION_RE.search(spec.authentication or "")
+    payment_provider = _canonical(_PAY_RE, spec.payments, _PAY_CANON)
+    decisions = {
+        "product": item("product", spec.product),
+        "domain": item("domain", spec.domain, "SUPPORTED_IMPLICATION"),
+        "target_users": item("target_users", spec.target_users),
+        "features": item("features", spec.features),
+        "roles": item("roles", spec.roles),
+        "workflows": item("workflows", spec.workflows),
+        "business_rules": item("business_rules", spec.business_rules),
+        "authentication": item("authentication", spec.authentication),
+        "authentication_implementation": item(
+            "authentication_implementation",
+            auth_impl.group(0) if auth_impl else "",
+            "CONFIRMED" if auth_impl else "UNKNOWN",
+        ),
+        "payment": item("payments", spec.payments),
+        "payment_provider": item(
+            "payment_provider", payment_provider,
+            "CONFIRMED" if payment_provider else "UNKNOWN",
+        ),
+        "inventory": item("inventory", spec.inventory),
+        "technology": item("technology", spec.technology),
+        "database": item("database", spec.database, "CONFIRMED" if spec.database else "UNKNOWN"),
+        "infrastructure": item("infrastructure", spec.infrastructure),
+        "storage": item("storage", spec.storage),
+        "integrations": item("integrations", spec.integrations),
+        "shipping": item("shipping", spec.shipping),
+        "online_store": item("online_store", spec.online_store),
+        "marketplace": item("marketplace", spec.marketplace),
+    }
+    grouped = {
+        "confirmed_decisions": {key: value for key, value in decisions.items() if value["status"] == "CONFIRMED"},
+        "not_required_decisions": {key: value for key, value in decisions.items() if value["status"] == "NOT_REQUIRED"},
+        "unknown_decisions": {key: value for key, value in decisions.items() if value["status"] == "UNKNOWN"},
+        "inferred_decisions": {key: value for key, value in decisions.items() if value["status"] in {"INFERRED", "SUPPORTED_IMPLICATION"}},
+    }
+    return {
+        "decisions": decisions,
+        **grouped,
+        "rules": [
+            "User-confirmed decisions override every AI suggestion.",
+            "UNKNOWN must remain unknown and must not become a concrete project decision.",
+            "NOT_REQUIRED is a hard scope exclusion and must not become an active feature.",
+            "Recommendations and examples are not canonical decisions.",
+        ],
+    }
 
 
 _D06_SNAPSHOT_FIELDS = {
@@ -1291,6 +1361,36 @@ def _d04_negative(value: str) -> bool:
     return str(value or "").strip().lower() in {"no", "n", "false", "none", "tidak", "tidak perlu", "tanpa"}
 
 
+_D072_SCOPE_TERMS = {
+    "shipping": r"shipping|shipment|pengiriman|kurir|fulfillment",
+    "online_store": r"online\s+store|toko\s+online|storefront|e[- ]commerce|ecommerce",
+    "marketplace": r"marketplace",
+}
+_D072_NEGATIVE_SCOPE_RE = r"no|not|tidak|tanpa|bukan|di luar|out of scope|tidak diperlukan|tidak digunakan"
+
+
+def _d072_scope_text(project: dict) -> str:
+    merged = merge_discovery_answers(project)
+    values = [str(merged.get(field) or "") for field in _D04_CATEGORY_FIELDS.values()]
+    values.extend(str(answer.get("value") or "") for answer in (_discovery(project).get("answers") or {}).values())
+    return " ".join(values).lower()
+
+
+def _d072_scope_exclusions(project: dict) -> list[dict]:
+    text = _d072_scope_text(project)
+    exclusions = []
+    for key, terms in _D072_SCOPE_TERMS.items():
+        if re.search(rf"(?:{_D072_NEGATIVE_SCOPE_RE})[^.\n]{{0,70}}(?:{terms})|(?:{terms})[^.\n]{{0,70}}(?:{_D072_NEGATIVE_SCOPE_RE})", text, re.IGNORECASE):
+            exclusions.append({
+                "key": key,
+                "value": "NOT_REQUIRED",
+                "status": "NOT_REQUIRED",
+                "source": "DISCOVERY_ANSWER",
+                "source_id": "scope_answer",
+            })
+    return exclusions
+
+
 def completeness_check(project: dict) -> dict:
     """Deterministic readiness check for Product Understanding Review, not PRD completion."""
     merged = merge_discovery_answers(project)
@@ -1298,7 +1398,8 @@ def completeness_check(project: dict) -> dict:
     domain = infer_domain(merged)
     statuses = {category: _discovery_category_status(project, category) for category in _D04_CATEGORY_FIELDS}
     statuses["purpose"] = "CONFIRMED" if (merged.get("description") or merged.get("business_goal") or merged.get("main_problem")) else statuses["purpose"]
-    statuses["shipping"] = "NOT_REQUIRED" if re.search(r"(no|not|tidak|tanpa)\s+(online store|toko online|shipping|pengiriman|marketplace)", text) else "UNKNOWN"
+    shipping_excluded = any(item["key"] == "shipping" for item in _d072_scope_exclusions(project))
+    statuses["shipping"] = "NOT_REQUIRED" if shipping_excluded else "UNKNOWN"
     if statuses["payment"] == "CONFIRMED" and _d04_negative(merged.get("payment_requirement")):
         statuses["payment"] = "NOT_REQUIRED"
 
@@ -1520,8 +1621,8 @@ def build_product_understanding(project: dict) -> dict:
     unknown = [item for item in items.values() if item["status"] == "UNKNOWN"]
     not_required = [item for item in items.values() if item["status"] == "NOT_REQUIRED"]
     out_of_scope = [items["non_goals"]] if items["non_goals"]["status"] != "UNKNOWN" else []
-    if completeness.get("category_status", {}).get("shipping") == "NOT_REQUIRED":
-        out_of_scope.append({"key": "shipping", "value": "", "status": "NOT_REQUIRED", "source": "DOMAIN_RULE", "source_id": "completeness"})
+    existing_scope_keys = {item.get("key") for item in out_of_scope}
+    out_of_scope.extend(item for item in _d072_scope_exclusions(project) if item["key"] not in existing_scope_keys)
     in_scope = [item for item in confirmed + inferred if item["key"] != "non_goals"]
     return {
         "summary": items,
@@ -1842,22 +1943,22 @@ Write clean, precise Markdown that a coding agent can implement without guessing
 
 Quality contract:
 - Treat the user's project requirements as the source of truth. Do not invent major features, integrations, roles, or infrastructure that are not requested. If a capability is out of scope, say so explicitly.
-- Make one canonical technical decision for authentication, database, backend, frontend, deployment, payments, and AI provider. Never mix alternatives such as Stripe and Midtrans, PostgreSQL and MongoDB, or Next.js and React CRA in the implementation plan.
-- If a required choice is missing, choose one reasonable default, use it consistently in every section, and record the decision and reason in Section 14. Only mark an item unresolved when implementation truly cannot proceed without the user's answer.
+- Make one canonical technical decision only when the user confirmed it. EXAMPLE_ONLY alternatives are not project decisions.
+- If a choice is missing, keep it UNKNOWN/TBD everywhere. Do not select a concrete technology, database, infrastructure, auth implementation, payment provider, or storage provider.
 - Keep a traceable chain: every functional requirement must map to a page/state, data entity, API or service behavior, acceptance test, and delivery phase. Do not reference tables, endpoints, roles, or services that are not defined elsewhere.
 - Define the MVP boundary clearly. Put optional future ideas under Non-Goals or Future Enhancements, not inside mandatory requirements.
 - Use concrete field names, types, validation rules, status transitions, permissions, error behavior, and success criteria. Avoid vague words such as 'manage' or 'seamless'.
 - For AI generation, define one provider abstraction, one primary configuration, and an explicit fallback policy. Never put API keys in frontend code.
 - For asynchronous or streaming work, describe the job lifecycle, polling/streaming endpoint, persistence, retry, timeout, and reconnect behavior consistently.
-- Never use placeholder text such as TBD, lorem ipsum, or fake secrets. Use <server-secret> only in example environment variables.
+- Use UNKNOWN/TBD for unresolved decisions; never use lorem ipsum or fake secrets. Use <server-secret> only in example environment variables.
 
 Mandatory canonical MVP decisions for this greenfield product:
 - The PRD describes the user's product exactly as specified, honoring every explicitly requested technology, database, payment gateway, auth method, and role. Do not substitute a different stack.
-- If a required choice was not specified, pick ONE reasonable default, use it consistently, and record the decision and reason in Section 14. Never mix alternatives.
+- If a choice was not specified, keep it UNKNOWN/TBD everywhere. Never turn an example or recommendation into a project decision.
 - Define the MVP boundary around only what the user requested; put optional ideas under Non-Goals or Future Enhancements.
 - Do not describe this PRD-writing application, the generation tooling, or any meta-layer. The document is only about the user's business.
 - Only invent features, roles, entities, or integrations the user's requirements genuinely imply; otherwise mark them out of scope.
-- Never use placeholder text such as TBD, lorem ipsum, or fake secrets. Use <server-secret> only in example environment variables.
+- Use UNKNOWN/TBD for unresolved decisions; never use lorem ipsum or fake secrets. Use <server-secret> only in example environment variables.
 
 Output only the requested 14-section PRD in clean Markdown."""
 
@@ -1886,12 +1987,12 @@ PRD_SECTION_GUIDANCE = {
     "## 5. UX, Pages, and Interaction States": "Specify every page URL, role, layout, components, forms, validation, loading, empty, error, success, and responsive states.",
     "## 6. Data Model and Database Schema": "Define each entity, fields, types, required/nullability, defaults, indexes, relations, ON DELETE behavior, and lifecycle rules in markdown tables. Use the entities the user's product actually needs.",
     "## 7. API Specification": "Define each endpoint separately with method, URL, auth, request schema, validation, success response, error responses, and side effects. Only include the routes the product needs.",
-    "## 8. Authentication, Authorization, and Security": "Define login/session flow, roles, authorization rules, secret handling, input validation, and security controls, based on the auth approach actually chosen for the product.",
+    "## 8. Authentication, Authorization, and Security": "Define login/session requirements, roles, authorization rules, secret handling, input validation, and security controls. Keep the auth implementation UNKNOWN when not confirmed.",
     "## 9. Integrations, Payments, and Notifications": "List external services, triggers, payloads, retry/failure behavior, payment states, and notification events. State not required when applicable.",
-    "## 10. Tech Stack and System Architecture": "Choose concrete frontend/backend/database/deployment technologies and describe module boundaries and data flow, based on the stack actually chosen for the product.",
+    "## 10. Tech Stack and System Architecture": "Describe confirmed frontend/backend/database/deployment technologies and module boundaries/data flow. Use UNKNOWN/TBD for every unspecified choice; do not select a stack.",
     "## 11. Validation, Errors, and Observability": "Define business validation, user-facing errors, logging fields, monitoring signals, and recovery behavior.",
     "## 12. Testing and Acceptance Criteria": "Give test cases and objective Given/When/Then acceptance criteria for every critical flow.",
-    "## 13. Delivery Plan and Environment": "Define the implementation phases in a sensible order, then environment variables, local setup, deployment, and definition of done.",
+    "## 13. Delivery Plan and Environment": "Define implementation phases, environment variables, local setup, deployment, and definition of done without selecting unspecified infrastructure or tooling.",
     "## 14. Assumptions and Decisions": "List every assumption and decision that prevents an AI coding agent from guessing. Mark unresolved items explicitly.",
 }
 
@@ -1972,7 +2073,8 @@ def validate_prd_consistency(content: str) -> None:
         if not any(t in b.lower() for t in terms):
             missing.append(f"{heading}: missing core content")
 
-    if "[image" in content.lower() or "lorem" in content.lower() or "tbd" in content.lower():
+    authority_markers_removed = re.sub(r"\b(?:unknown|tbd|undetermined|belum ditentukan)\b", "", content, flags=re.IGNORECASE)
+    if "[image" in content.lower() or "lorem" in content.lower() or re.search(r"\bplaceholder\b", authority_markers_removed, re.IGNORECASE):
         missing.append("placeholder text present")
 
     if missing:
@@ -2244,24 +2346,22 @@ Output only the copy-paste-ready prompt."""
 
 
 CANONICAL_GLOBAL_RULES = """PROJECT FOLLOWING RULES:
+- AUTHORITY: CONFIRMED user decisions outrank NOT_REQUIRED user decisions, which outrank UNKNOWN/UNDECIDED, safe technical implications, and AI recommendations.
+- UNKNOWN is a hard state. Keep unknown technology, database, infrastructure, authentication implementation, payment provider, and storage provider as UNKNOWN/TBD.
+- NOT_REQUIRED is a hard exclusion. Never turn it into an active feature or implementation workflow.
 - The PRD describes the USER'S product as stated in PROJECT REQUIREMENTS. Do not describe this PRD-writing tool, the generator, or any meta-layer; the document is purely about the user's business.
-- Honor every technology, framework, language, database, payment gateway, authentication method, role, and integration that the user explicitly named. If the user said Laravel, MySQL, and Midtrans, use exactly those. Never substitute a different stack.
-- If the user left a required choice unspecified (for example no database, auth, or payment gateway named), choose ONE reasonable default, use it consistently everywhere, and record the decision and reason in Section 14. Never mix alternatives such as Stripe and Midtrans, PostgreSQL and MongoDB, or Next.js and React CRA.
+- Honor every technology, framework, language, database, payment gateway, authentication method, role, and integration that the user explicitly named. Never substitute a different stack.
+- If the user left a choice unspecified, keep it UNKNOWN/TBD everywhere. Do not select a default or turn an example into a project decision.
 - Define the MVP boundary around only what the user asked for. Put optional or future ideas under Non-Goals or Future Enhancements, not inside mandatory requirements.
 - Only invent features, roles, entities, or integrations when the user's requirements genuinely imply them; otherwise state them as out of scope.
 - Keep a traceable chain: every functional requirement must map to a page/state, data entity, API or service behavior, acceptance test, and delivery phase. Do not reference tables, endpoints, roles, or services that are not defined elsewhere.
-- Use ONE coherent authentication architecture, consistently across every section (login page, login API, session middleware, API security, frontend session, admin/customer authorization, environment variables, testing). Pick ONCE and describe the full path:
-  - SESSION/COOKIE model: Authentication Provider = [user's choice, e.g. NextAuth/Laravel] Credentials; Session Strategy = JWT; Browser Auth = secure httpOnly session cookie; API Authorization = server verifies the session cookie/JWT on every request. The browser NEVER sends a raw Authorization: Bearer header that duplicates the session; the cookie is the credential.
-  - If a Bearer token is genuinely required (e.g. third-party API, mobile app), define it explicitly and link it to the same identity: token issuer = same auth server; format = signed JWT; validation = verify signature + claims + expiry on the API; lifetime = e.g. 7 days with rotation; how the frontend obtains it = from the login response/session claim; how the API validates = same secret/keys as session.
-  - Do NOT keep two unrelated auth systems (NextAuth session cookie + a separate custom JWT + a third login token) without a single explained source of truth. Never mix "session cookie" and "Bearer JWT" as parallel, unexplained mechanisms.
+- Describe login as required when confirmed, but keep the authentication implementation UNKNOWN unless the user chose one. Do not select an auth framework, token format, cookie strategy, OAuth provider, or password hashing algorithm.
+  - Do NOT keep two unrelated authentication systems or parallel unexplained credentials without a single source of truth. Keep the implementation UNKNOWN when it is not confirmed.
   - State clearly which mechanism protects the API chosen for the product, and name the auth env vars (e.g. AUTH_SECRET / NEXT_PUBLIC_AUTH_URL) once, consistently.
-- Pick ONE infrastructure/hosting stack and apply it consistently across tech stack, architecture, environment variables, local development, deployment, database, media storage, external services, and setup instructions:
-  - For each external service (database, storage, hosting, payments, AI, email), state ONE provider, ONE purpose, and ONE environment-variable set.
-  - Keep local development in sync: the same database/storage choices used in deployment must appear in setup instructions.
-  - If the user did NOT specify a provider for a concern (hosting, database vendor, storage, deployment), do NOT select a concrete provider. Mark it "Undetermined" (belum ditentukan) or state an explicitly labeled assumption; never fill in a provider just because it is a common default.
+- Keep infrastructure, database, and storage UNKNOWN when the user did not specify them. Separate development tooling from production infrastructure and do not choose a hosting provider.
 - Pick ONE canonical value for every important business constant and apply it identically in every section (overview, goals, constraints, journey, FRs, UX, database, API, security, integration, architecture, validation, testing, delivery, decisions, env vars). Pick based on the user's actual requirement; do not invent or estimate a value. Never write a number one way in one section and differently elsewhere (e.g. radius 50m in overview but 100m in database) — that is a contradiction.
 - Pick ONE canonical terminology/vocabulary and use it everywhere. Do not mix synonyms for the same concept: use exactly one of {employee, karyawan, staff, user} for the same role, one of {admin, superadmin} for a role, one of {PRESENT, MASUK} for a concept, and one route name per page. Do not create multiple routes for the same page.
-- Pick ONE password hashing algorithm (either Argon2id or bcrypt) and use it consistently in database, auth, security, architecture, tech stack, assumptions, delivery, setup, and testing. Never write "Argon2id / bcrypt".
+- Do not choose a password hashing algorithm when authentication implementation is UNKNOWN.
 - Pick ONE source of truth for business configuration. If a value is admin-editable or manager-controllable (e.g. office latitude/longitude, attendance radius, active status), it MUST come from the database; environment variables are only for secrets, API keys, and immutable infrastructure config. Never define a business value in both a database field and an env var as alternative sources.
 - Define ONE canonical route per page (e.g. dashboard) and use that exact route in journey, UX, API, middleware, architecture, testing, and delivery. Do not introduce alias routes.
 - Define Google OAuth account linking explicitly. If an existing password account shares the same email as a Google login, state LINK TO EXISTING ACCOUNT or REJECT LINKING; never create duplicate accounts silently."""
@@ -2286,7 +2386,7 @@ CANONICAL_COMMERCE_RULES = """COMMERCE (order / inventory / shipping) RULES — 
   - Do NOT also deduct stock at checkout. Do NOT say "deduct at checkout OR reserve at checkout". Never combine two mechanisms.
   - Concurrency: stock reservation must use a database transaction with an atomic conditional update (stock >= requested_quantity check) so two customers cannot reserve the same last unit; the customer losing the race gets a stock-exhausted error.
   - Stock belongs to the product VARIANT (e.g. Kemeja / M-Black), never a generic product-level integer, when the product has size/color/SKU variations. Use same variant identity in database, API, and journey.
-- Use exactly ONE canonical ORDER status state machine, consistently across every section (database, API, journey, FRs, UI, admin permissions, business rules, Midtrans mapping, testing, acceptance criteria, delivery plan, DoD). The canonical set is:
+ - Use exactly ONE canonical ORDER status state machine, consistently across every section (database, API, journey, FRs, UI, admin permissions, business rules, payment mapping, testing, acceptance criteria, delivery plan, DoD). The canonical set is:
   - PENDING → PAID → PROCESSING → SHIPPED → DELIVERED (happy path)
   - PENDING → CANCELLED (cancellation path)
   - PENDING → EXPIRED (expiration path)
@@ -2327,10 +2427,14 @@ def canonical_mvp_decisions(project: dict) -> str:
 
 def prd_user_prompt(project: dict, language: str) -> str:
     lang = "Bahasa Indonesia" if language == "id" else "English"
+    authority = json.dumps(canonical_authority(build_canonical_spec(project)), sort_keys=True, ensure_ascii=True)
     return f"""Generate a concise but implementation-ready Product Requirements Document in {lang} for the following project.
 
 PROJECT REQUIREMENTS:
 {project_context(project)}
+
+CANONICAL AUTHORITY (structured; higher priority than every suggestion or example):
+{authority}
 
 {canonical_mvp_decisions(project)}
 
@@ -2347,9 +2451,9 @@ RULES:
 - In Section 7, define the actual API routes the product needs, with method, auth, request schema, success response, error responses, and side effects. Do not invent routes unrelated to the product.
 - In Section 8, describe the authentication and authorization approach actually chosen for the product (honoring any user-stated choice), and the secret/validation/security controls that follow from it.
 - In Section 9, list the real external services the product uses (payment gateway, email, AI, etc.) and their retry/failure behavior; if none are needed, state that clearly.
-- In Section 10, use the stack and architecture actually chosen (honoring any user-stated choice), and describe module boundaries and data flow.
+ - In Section 10, use the stack and architecture actually chosen (honoring any user-stated choice), and describe module boundaries and data flow. If unspecified, keep the choice UNKNOWN/TBD.
 - In Sections 10 and 13, describe the real deployment model for the product; do not assume a specific platform unless the user requires it.
-- In Section 14, record every assumption and decision, including the resolution of any unspecified choice, and state whether any unresolved items remain.
+ - In Section 14, record every confirmed decision, hard exclusion, and unresolved UNKNOWN; do not resolve an unspecified choice.
 - Never repeat one of the 14 required section headings as a `###` or another heading; use each required `##` heading exactly once. Other numbered subheadings are allowed.
 - In Section 12, include concrete Given/When/Then acceptance tests for the product's critical flows: authentication/authorization, the primary user journey, any async/generation flow, exports, restore, delete, rate limiting, and secret handling. Label them AC-AUTH, AC-AUTHZ, AC-GENERATION (if the product generates content), AC-USAGE, AC-EXPORT, AC-RESTORE, AC-DELETE, AC-RATE-LIMIT, and AC-SECRET as applicable.
 - Mark genuinely unclear product items with "⚠ Needs Clarification" plus the assumption used.
@@ -2537,8 +2641,9 @@ REPAIR_SYSTEM = """You fix specific inconsistencies in a PRD section. You are gi
 spec (the single source of truth) and a list of paragraph-level conflicts in one or more
 sections. Rewrite ONLY the affected section bodies to match the canonical spec.
 Rules: keep every unchanged part identical; do NOT add new features; do NOT change scope,
-goals, or the canonical decisions; do NOT introduce any provider/technology/database other
-than the canonical one. Return only the fixed sections, each with its exact `## N.` heading."""
+goals, or the canonical decisions; UNKNOWN must remain UNKNOWN/TBD; NOT_REQUIRED is a hard
+exclusion; do NOT introduce any provider/technology/database/auth implementation other than
+the canonical one. Return only the fixed sections, each with its exact `## N.` heading."""
 
 _PAY_FAM = {"midtrans": ("midtrans",), "stripe": ("stripe",), "xendit": ("xendit",), "paypal": ("paypal",)}
 _STOR_FAM = {"aws s3": ("s3", "amazon s3"), "cloudinary": ("cloudinary",),
@@ -2558,9 +2663,87 @@ _TECH_CONFLICTS = {
 _AI_CORE_RE = re.compile(r"\b(generate|generation|ai|prd)\b", re.IGNORECASE)
 _NONGOAL_AI_RE = re.compile(r"\b(out of scope|di luar|non-goal|bukan prioritas)\b[^.\n]{0,90}\b(generat|ai|prd)\b", re.IGNORECASE)
 
+_D072_UNSUPPORTED_TERMS = {
+    "technology": r"\b(next\.?js|react|vue|angular|svelte|node(?:\.js)?|typescript|tailwind(?:\s+css)?|prisma)\b",
+    "database": r"\b(postgresql|postgres|mongodb|mysql|mariadb|sqlite|supabase|neon)\b",
+    "authentication_implementation": r"\b(nextauth|next-auth|jwt|bcrypt|argon2|oauth|oauth2|session\s+cookie)\b",
+    "infrastructure": r"\b(vercel|aws|railway|render|heroku|kubernetes|digitalocean|fly\.io|docker)\b",
+    "payment_provider": r"\b(stripe|midtrans|xendit|paypal)\b",
+    "storage": r"\b(s3|cloudinary|firebase\s+storage|supabase\s+storage)\b",
+}
+_D072_SCOPE_TERMS_RE = {
+    "shipping": r"\b(shipping|shipment|pengiriman|kurir|fulfillment|delivery\s+tracking)\b",
+    "online_store": r"\b(online\s+store|toko\s+online|storefront|e[- ]commerce|ecommerce)\b",
+    "marketplace": r"\bmarketplace\b",
+}
+_D072_SAFE_CONTEXT = (
+    "example_only", "example only", "optional recommendation", "not selected", "not chosen",
+    "not required", "out of scope", "di luar", "tidak diperlukan", "tidak digunakan",
+    "tidak dipilih", "belum ditentukan", "unknown", "tbd", "do not use", "do not select",
+    "jangan gunakan", "jangan memilih", "jangan pilih",
+)
+
 
 def _families_for(canonical: str, fams: dict) -> set:
     return {name for name in fams if name.lower() in canonical.lower()}
+
+
+def _d072_safe_line(line: str, term: str) -> bool:
+    low = line.lower()
+    if "optional recommendation" in low and "selected" not in low and "canonical" not in low:
+        return True
+    if "docker" in term and any(word in low for word in ("development", "local", "dev tooling")) and "production" not in low:
+        return True
+    return any(marker in low for marker in _D072_SAFE_CONTEXT)
+
+
+def canonical_authority_violations(content: str, spec: CanonicalProductSpec) -> list[Conflict]:
+    """Compare concrete PRD claims with frozen authority without trusting prose."""
+    authority = canonical_authority(spec)["decisions"]
+    issues: list[Conflict] = []
+    bodies = parse_section_bodies(content)
+    for category, pattern in _D072_UNSUPPORTED_TERMS.items():
+        if authority.get(category, {}).get("status") != "UNKNOWN":
+            continue
+        for section, body in bodies.items():
+            for match in re.finditer(pattern, body, re.IGNORECASE):
+                line = body[max(0, body.rfind("\n", 0, match.start()) + 1):body.find("\n", match.end()) if body.find("\n", match.end()) >= 0 else len(body)].strip()
+                term = match.group(0)
+                if _d072_safe_line(line, term):
+                    continue
+                issues.append(Conflict(
+                    kind=f"unsupported_{category}", severity="high", section=section,
+                    expected="UNKNOWN/TBD", actual=term,
+                    rule=f"PRD promotes UNKNOWN {category} to a concrete decision",
+                    evidence=line[:240],
+                ))
+                break
+    for category, pattern in _D072_SCOPE_TERMS_RE.items():
+        if authority.get(category, {}).get("status") != "NOT_REQUIRED":
+            continue
+        for section, body in bodies.items():
+            for match in re.finditer(pattern, body, re.IGNORECASE):
+                line = body[max(0, body.rfind("\n", 0, match.start()) + 1):body.find("\n", match.end()) if body.find("\n", match.end()) >= 0 else len(body)].strip()
+                term = match.group(0)
+                if _d072_safe_line(line, term):
+                    continue
+                issues.append(Conflict(
+                    kind=f"unsupported_{category}", severity="high", section=section,
+                    expected="NOT_REQUIRED", actual=term,
+                    rule=f"PRD promotes NOT_REQUIRED {category} to an active feature",
+                    evidence=line[:240],
+                ))
+                break
+    return issues
+
+
+def audit_canonical_authority(content: str, spec: CanonicalProductSpec) -> dict:
+    violations = canonical_authority_violations(content, spec)
+    return {
+        "status": "PASS" if not violations else "FAIL",
+        "authority": canonical_authority(spec),
+        "violations": [item.model_dump() for item in violations],
+    }
 
 
 def canonical_violations(content: str, spec: CanonicalProductSpec) -> list[Conflict]:
@@ -2632,6 +2815,7 @@ def canonical_violations(content: str, spec: CanonicalProductSpec) -> list[Confl
                         rule="Section uses a password hashing algorithm different from the canonical decision",
                         evidence="password hashing mismatch"))
                     break
+    issues.extend(canonical_authority_violations(content, spec))
     return issues
 
 
@@ -2650,6 +2834,9 @@ def _repair_prompt(spec: CanonicalProductSpec, sections: dict, violations: list[
     lines = [
         "FROZEN CANONICAL SPEC (single source of truth — do NOT change, do NOT pick alternatives):",
         render_canonical_spec(spec),
+        "",
+        "CANONICAL AUTHORITY (structured; UNKNOWN and NOT_REQUIRED are binding):",
+        json.dumps(canonical_authority(spec), sort_keys=True, ensure_ascii=True),
         "",
         "CONFLICTS TO FIX:",
     ]
@@ -2810,6 +2997,8 @@ def prd_chunk_user_prompt(project: dict, language: str, start: int, end: int) ->
     guidance = "\n".join(f"{heading}: {PRD_SECTION_GUIDANCE[heading]}" for heading in REQUIRED_PRD_HEADINGS[start:end])
     _fc = project.get("_frozen_context") or {}
     frozen = _fc.get("frozen") or canonical_project_decisions(project)
+    authority = _fc.get("canonical_authority") or canonical_authority(build_canonical_spec(project))
+    authority_context = json.dumps(authority, sort_keys=True, ensure_ascii=True)
     rules = _fc.get("rules") or canonical_mvp_decisions(project)
     snapshot = _fc.get("discovery_snapshot")
     discovery_context = json.dumps({
@@ -2827,6 +3016,9 @@ Project requirements:
 
 FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT change them):
 {frozen}
+
+CANONICAL AUTHORITY (structured JSON; this is authoritative):
+{authority_context}
 
 FROZEN CONFIRMED DISCOVERY CONTEXT (reference only; do not reinterpret decisions):
 {discovery_context}
@@ -2848,6 +3040,9 @@ Project requirements:
 
 FROZEN CANONICAL SPEC (single source of truth — use these exact values, do NOT change them):
 {frozen}
+
+CANONICAL AUTHORITY (structured JSON; this is authoritative):
+{authority_context}
 
 FROZEN CONFIRMED DISCOVERY CONTEXT (reference only; do not reinterpret decisions):
 {discovery_context}
@@ -3013,6 +3208,12 @@ async def run_generation_job(job_id: str, generation_type: str, project: dict, u
             if repair_diag.get("unresolved"):
                 report["unresolved"] = repair_diag["unresolved"]
             report["repair"] = repair_diag
+            authority_report = audit_canonical_authority(content, build_canonical_spec(project))
+            report["authority"] = authority_report
+            if authority_report["violations"]:
+                raise ValueError("Canonical authority validation failed: " + "; ".join(
+                    item["rule"] + " (" + item["actual"] + ")" for item in authority_report["violations"][:8]
+                ))
             job["report"] = report
             job["content"] = content
         now = datetime.now(timezone.utc).isoformat()
@@ -3064,9 +3265,14 @@ def _freeze_generation_project(project: dict, canonical_spec: CanonicalProductSp
     metadata = _generation_metadata(frozen, canonical_spec)
     snapshot = deepcopy(_discovery(frozen).get("confirmation_snapshot")) if frozen.get("discovery_status") == "confirmed" else None
     frozen_spec = canonical_spec.model_dump()
+    authority = canonical_authority(canonical_spec)
     frozen["_frozen_canonical_spec"] = frozen_spec
     frozen["_frozen_context"] = {
         "canonical_spec": frozen_spec,
+        "canonical_authority": authority,
+        "confirmed_decisions": authority["confirmed_decisions"],
+        "not_required_decisions": authority["not_required_decisions"],
+        "unknown_decisions": authority["unknown_decisions"],
         "canonical_spec_fingerprint": metadata["canonical_spec_fingerprint"],
         "discovery_snapshot": snapshot,
         "product_understanding": deepcopy(snapshot.get("summary")) if snapshot else None,

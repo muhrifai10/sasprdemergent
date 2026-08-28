@@ -1241,7 +1241,8 @@ def test_phase3_saas_no_commerce_rules_in_dependency_prompt():
     saas = {"name": "SaaS CRM", "product_type": "SaaS", "description": "CRM untuk tenant",
             "preferred_technology": "Next.js + PostgreSQL"}
     p = server.prd_chunk_user_prompt(saas, "id", 3, 4).lower()
-    assert "checkout" not in p and "shipped" not in p and "inventory" not in p
+    assert "checkout" not in p and "shipped" not in p
+    assert "commerce (order / inventory / shipping) rules" not in p
     assert "postgresql" in p
 
 
@@ -1250,8 +1251,7 @@ def test_phase3_regression_payment_and_storage_preserved():
          "preferred_technology": "Next.js + PostgreSQL", "payment_requirement": "Midtrans"}
     prompt = server.prd_chunk_user_prompt(p, "id", 3, 4)
     assert "Payment (frozen): Midtrans" in prompt
-    # Canonical anti-mix rule guards against Stripe; no Stripe-only section invented.
-    assert "Stripe and Midtrans" in prompt
+    assert "UNKNOWN/TBD" in prompt
 
 
 # ---------- Phase 4: automatic conflict repair loop ----------
@@ -1606,7 +1606,7 @@ def test_phase7_no_provider_examples_in_global_rules():
     rules = server.canonical_mvp_decisions({"name": "X", "product_type": "SaaS"}).lower()
     for p in ("vercel", "neon", "cloudinary", "heroku", "railway"):
         assert p not in rules, f"{p} leaked into global rules"
-    assert "undetermined" in rules or "tbd" in rules
+    assert "unknown/tbd" in rules or "tbd" in rules
 
 
 def test_phase7_no_infra_auto_selected():
@@ -3181,3 +3181,137 @@ def test_d07_realistic_confirmed_cases_generate_with_frozen_context(monkeypatch,
     else:
         assert spec.ai_capability.startswith("Confirmed") and spec.technology == ""
         assert all(provider not in prompt for provider in ("OpenAI", "Anthropic", "DeepSeek", "Gemini"))
+
+
+# ---------- D0.7.2: canonical authority + scope preservation ----------
+
+def _d072_confirmed_project():
+    items = {
+        "product": {"key": "product", "value": "Retail POS", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "product_type": {"key": "product_type", "value": "POS", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "target_users": {"key": "target_users", "value": "Owner, Admin, Kasir", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "core_features": {"key": "core_features", "value": "Product, inventory, sales, Cash + QRIS, receipt, reports", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "authentication": {"key": "authentication", "value": "Login required", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "payment": {"key": "payment", "value": "Cash + QRIS", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "inventory": {"key": "inventory", "value": "Enabled; stock decreases after successful transaction", "status": "CONFIRMED", "source": "DISCOVERY_ANSWER"},
+        "technology": {"key": "technology", "value": "", "status": "UNKNOWN", "source": "UNKNOWN"},
+        "infrastructure": {"key": "infrastructure", "value": "", "status": "UNKNOWN", "source": "UNKNOWN"},
+        "storage": {"key": "storage", "value": "", "status": "UNKNOWN", "source": "UNKNOWN"},
+    }
+    snapshot = {
+        "summary": {"summary": items, "scope": {"in_scope": [], "out_of_scope": [
+            {"key": "shipping", "value": "NOT_REQUIRED", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER"},
+            {"key": "online_store", "value": "NOT_REQUIRED", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER"},
+            {"key": "marketplace", "value": "NOT_REQUIRED", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER"},
+        ]}},
+        "answers": {}, "status": "confirmed", "confirmed_at": "2026-08-28T00:00:00+00:00", "original_project_fields": {},
+    }
+    return {"id": "p1", "user_id": "u1", "name": "Retail POS", "description": "Retail POS", "discovery_status": "confirmed",
+            "discovery": {"questions": [], "answers": {}, "confirmation_snapshot": snapshot}}
+
+
+def test_d072_authority_groups_unknown_and_not_required_states():
+    authority = server.canonical_authority(server.build_canonical_spec(_d072_confirmed_project()))
+    assert authority["unknown_decisions"]["technology"]["status"] == "UNKNOWN"
+    assert authority["unknown_decisions"]["database"]["status"] == "UNKNOWN"
+    assert authority["unknown_decisions"]["authentication_implementation"]["status"] == "UNKNOWN"
+    assert authority["unknown_decisions"]["payment_provider"]["status"] == "UNKNOWN"
+    assert authority["not_required_decisions"]["shipping"]["value"] == "NOT_REQUIRED"
+    assert authority["not_required_decisions"]["online_store"]["value"] == "NOT_REQUIRED"
+
+
+def test_d072_explicit_scope_exclusions_are_discovery_authority():
+    project = {"name": "POS", "description": "Retail POS", "desired_features": "Tidak digunakan sebagai online store dan shipping tidak diperlukan.",
+               "discovery": {"questions": [{"id": "q_f", "category": "desired_features"}],
+                             "answers": {"q_f": {"value": "Tidak digunakan sebagai online store dan shipping tidak diperlukan.", "status": "CONFIRMED"}}}}
+    exclusions = {item["key"]: item for item in server._d072_scope_exclusions(project)}
+    assert exclusions["shipping"]["status"] == "NOT_REQUIRED"
+    assert exclusions["shipping"]["source"] == "DISCOVERY_ANSWER"
+    assert exclusions["online_store"]["status"] == "NOT_REQUIRED"
+
+
+def test_d072_confirmation_snapshot_freezes_scope_exclusions(monkeypatch):
+    store = _seed(monkeypatch, {"p1": {
+        "id": "p1", "user_id": "u1", "name": "POS", "description": "Retail POS",
+        "target_users": "Owner, Admin, Kasir", "desired_features": "POS sales", "payment_requirement": "Cash + QRIS",
+        "discovery_status": "awaiting_confirmation",
+        "discovery": {"questions": [{"id": "q_scope", "category": "desired_features"}],
+                      "answers": {"q_scope": {"value": "Tidak digunakan sebagai online store dan shipping tidak diperlukan.", "status": "CONFIRMED"}}},
+    }})
+    asyncio.run(server.discovery_confirm("p1", {"user_id": "u1"}))
+    scope = store["projects"]["p1"]["discovery"]["confirmation_snapshot"]["summary"]["scope"]["out_of_scope"]
+    exclusions = {item["key"]: item for item in scope}
+    assert exclusions["shipping"] == {"key": "shipping", "value": "NOT_REQUIRED", "status": "NOT_REQUIRED", "source": "DISCOVERY_ANSWER", "source_id": "scope_answer"}
+    assert exclusions["online_store"]["status"] == "NOT_REQUIRED"
+
+
+@pytest.mark.parametrize(("body", "kind"), [
+    ("Selected framework: Next.js, Node.js, TypeScript, Tailwind, Prisma.", "unsupported_technology"),
+    ("Selected database: PostgreSQL.", "unsupported_database"),
+    ("Auth uses NextAuth, JWT, and bcrypt.", "unsupported_authentication_implementation"),
+    ("Production deployment: Vercel and AWS.", "unsupported_infrastructure"),
+    ("Payment provider: Stripe.", "unsupported_payment_provider"),
+    ("Object storage: S3.", "unsupported_storage"),
+])
+def test_d072_unknown_concrete_decisions_are_detected(body, kind):
+    spec = server.build_canonical_spec(_d072_confirmed_project())
+    assert any(item.kind == kind for item in server.canonical_authority_violations(_prd({9: body}), spec))
+
+
+@pytest.mark.parametrize(("body", "kind"), [
+    ("Shipping is not required and remains out of scope.", "unsupported_shipping"),
+    ("The storefront and marketplace are not required.", "unsupported_online_store"),
+])
+def test_d072_not_required_mentions_are_safe(body, kind):
+    spec = server.build_canonical_spec(_d072_confirmed_project())
+    assert not any(item.kind == kind for item in server.canonical_authority_violations(_prd({1: body}), spec))
+
+
+def test_d072_not_required_active_feature_is_detected():
+    spec = server.build_canonical_spec(_d072_confirmed_project())
+    content = _prd({1: "Users can track shipping deliveries from the storefront."})
+    kinds = {item.kind for item in server.canonical_authority_violations(content, spec)}
+    assert {"unsupported_shipping", "unsupported_online_store"} <= kinds
+
+
+def test_d072_optional_recommendation_is_not_canonical():
+    spec = server.build_canonical_spec(_d072_confirmed_project())
+    content = _prd({9: "OPTIONAL RECOMMENDATION: Next.js could be evaluated later; it is not selected."})
+    assert server.canonical_authority_violations(content, spec) == []
+
+
+def test_d072_authority_unknown_markers_are_not_placeholder_failures():
+    content = _prd({3: "FR-1 Login is required. The system validates credentials and returns a clear success or error response for the authorized user.",
+                    5: "Data model entity fields: Database UNKNOWN/TBD.", 6: "POST /api/login requires authentication.",
+                    7: "Authentication implementation: UNKNOWN/TBD."})
+    server.validate_prd_consistency(content)
+
+
+def test_d072_frozen_context_contains_structured_authority():
+    project = _d072_confirmed_project()
+    frozen = server._freeze_generation_project(project, server.build_canonical_spec(project))
+    context = frozen["_frozen_context"]
+    assert context["canonical_authority"]["unknown_decisions"]["technology"]["status"] == "UNKNOWN"
+    assert context["not_required_decisions"]["shipping"]["status"] == "NOT_REQUIRED"
+    assert context["discovery_snapshot"]["summary"]["scope"]["out_of_scope"][0]["source"] == "DISCOVERY_ANSWER"
+    prompt = server.prd_chunk_user_prompt(frozen, "id", 9, 10)
+    assert "CANONICAL AUTHORITY (structured JSON; this is authoritative)" in prompt
+    assert "unknown_decisions" in prompt and "not_required_decisions" in prompt
+
+
+def test_d072_authority_survives_fallback_and_repair(monkeypatch):
+    project = _d072_confirmed_project()
+    before = server.canonical_authority(server.build_canonical_spec(project))
+    frozen = server._freeze_generation_project(project, server.build_canonical_spec(project))
+    seen = []
+
+    async def fake_chunk(provider, api_key, base_url, model, current, language, start, end):
+        seen.append(deepcopy(current["_frozen_context"]["canonical_authority"]))
+        return "\n\n".join(f"{heading}\n\nConcrete details" for heading in server.REQUIRED_PRD_HEADINGS[start:end])
+
+    monkeypatch.setattr(server, "generate_prd_chunk", fake_chunk)
+    async def collect():
+        return [chunk async for chunk in server.stream_prd("9router", "k", "u", "m", frozen, "id", "s", "u")]
+    asyncio.run(collect())
+    assert seen and all(item == before for item in seen)
+    assert server.canonical_authority(server.build_canonical_spec(project)) == before
