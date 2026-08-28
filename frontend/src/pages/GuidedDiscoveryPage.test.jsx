@@ -54,6 +54,7 @@ const recommendationQuestion = {
 };
 
 let roots = [];
+let containers = [];
 
 function renderCard(question, props = {}) {
   const container = document.createElement("div");
@@ -63,9 +64,29 @@ function renderCard(question, props = {}) {
   return container;
 }
 
+function renderControlledCard(question, initialDraft) {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  containers.push(container);
+  const root = createRoot(container);
+  roots.push(root);
+  let draft = initialDraft;
+  const render = () => root.render(<QuestionCard question={question} copy={copy} draft={draft} onDraft={(intent) => { draft = intent; render(); }} />);
+  act(() => render());
+  return { container, getDraft: () => draft };
+}
+
+function typeInto(element, value) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+  setter.call(element, value);
+  act(() => element.dispatchEvent(new Event("input", { bubbles: true })));
+}
+
 afterEach(() => {
   act(() => roots.forEach((root) => root.unmount()));
   roots = [];
+  containers.forEach((container) => container.remove());
+  containers = [];
 });
 
 test("recommendations render their label, reason, and tradeoffs", () => {
@@ -92,6 +113,46 @@ test("textarea questions render catalog recommendations alongside custom input",
   expect(container.textContent).toContain("Owner");
   expect(container.querySelector('[data-testid="guided-custom-input-target.users"]')).toBeTruthy();
   expect(container.querySelector('[data-testid="guided-unknown-target.users"]')).toBeTruthy();
+});
+
+test("textarea accepts custom input after recommendation selection and emits one replacement draft", () => {
+  const question = {
+    question_id: "target.users",
+    category: "TARGET_USERS",
+    type: "textarea",
+    recommendations: [{ id: "target.users.product-manager", value: "Product Manager", label: "Product Manager", reason: "Common role", tradeoffs: [] }],
+    allow_custom: true,
+    allow_unknown: true,
+    allow_not_required: false,
+  };
+  const { container, getDraft } = renderControlledCard(question);
+  const recommendation = container.querySelector('[data-testid="guided-recommendation-target.users.product-manager"]');
+  const input = container.querySelector('[data-testid="guided-custom-input-target.users"]');
+
+  act(() => recommendation.click());
+  expect(input.disabled).toBe(false);
+  act(() => input.focus());
+  expect(document.activeElement).toBe(input);
+  typeInto(input, "Product manager and business analyst");
+
+  expect(getDraft()).toEqual({ question_id: "target.users", type: "custom", value: "Product manager and business analyst" });
+  expect(input.value).toBe("Product manager and business analyst");
+  expect(container.querySelector('[data-testid="guided-custom-submit-target.users"]').disabled).toBe(false);
+});
+
+test("the latest choice replaces the previous recommendation or custom draft without duplicates", () => {
+  const question = { ...recommendationQuestion, question_id: "target.users", type: "textarea", options: [], recommendations: [{ id: "target.users.owner", value: "Owner", label: "Owner", reason: "Common role", tradeoffs: [] }] };
+  const { container, getDraft } = renderControlledCard(question);
+  const input = container.querySelector('[data-testid="guided-custom-input-target.users"]');
+  const recommendation = container.querySelector('[data-testid="guided-recommendation-target.users.owner"]');
+
+  act(() => recommendation.click());
+  expect(getDraft()).toEqual({ question_id: "target.users", type: "recommendation", recommendation_id: "target.users.owner" });
+  typeInto(input, "A custom owner answer");
+  expect(getDraft()).toEqual({ question_id: "target.users", type: "custom", value: "A custom owner answer" });
+  act(() => recommendation.click());
+  expect(getDraft()).toEqual({ question_id: "target.users", type: "recommendation", recommendation_id: "target.users.owner" });
+  expect(Object.keys({ "target.users": getDraft() })).toHaveLength(1);
 });
 
 test("questions without recommendations still render without a recommendation panel", () => {

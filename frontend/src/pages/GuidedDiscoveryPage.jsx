@@ -255,6 +255,7 @@ export function QuestionCard({ question, copy, draft, serverDecision, submitting
   };
   const selectedRecommendation = draft?.type === "recommendation" ? draft.recommendation_id : null;
   const customValue = draft?.type === "custom" ? draft.value : "";
+  const updateCustomValue = (event) => onDraft(buildDecisionIntent(questionId, "custom", event.target.value));
 
   return (
     <Card className="border-white/10 bg-[#121212] shadow-none" data-testid={`guided-question-card-${questionId}`}>
@@ -306,7 +307,7 @@ export function QuestionCard({ question, copy, draft, serverDecision, submitting
             {question.allow_custom && (
               <div className="space-y-2" data-testid={`guided-custom-${questionId}`}>
                 <label htmlFor={`guided-custom-input-${questionId}`} className="text-[10px] font-mono uppercase tracking-widest text-zinc-600">{copy.answerOwn}</label>
-                {question.type === "textarea" || question.type === "text" ? <textarea id={`guided-custom-input-${questionId}`} value={customValue} onChange={(event) => onDraft(buildDecisionIntent(questionId, "custom", event.target.value))} disabled={submitting} placeholder={copy.customPlaceholder} rows={3} className="w-full resize-y border border-white/10 bg-black/20 px-3 py-3 text-sm text-white outline-none transition-colors placeholder:text-zinc-600 focus:border-indigo-400/60 disabled:opacity-50" data-testid={`guided-custom-input-${questionId}`} /> : <input id={`guided-custom-input-${questionId}`} value={customValue} onChange={(event) => onDraft(buildDecisionIntent(questionId, "custom", event.target.value))} disabled={submitting} placeholder={copy.customPlaceholder} className="min-h-11 w-full border border-white/10 bg-black/20 px-3 py-3 text-sm text-white outline-none transition-colors placeholder:text-zinc-600 focus:border-indigo-400/60 disabled:opacity-50" data-testid={`guided-custom-input-${questionId}`} />}
+                {question.type === "textarea" || question.type === "text" ? <textarea id={`guided-custom-input-${questionId}`} value={customValue} onInput={updateCustomValue} disabled={submitting} placeholder={copy.customPlaceholder} rows={3} className="w-full resize-y border border-white/10 bg-black/20 px-3 py-3 text-sm text-white outline-none transition-colors placeholder:text-zinc-600 focus:border-indigo-400/60 disabled:opacity-50" data-testid={`guided-custom-input-${questionId}`} /> : <input id={`guided-custom-input-${questionId}`} value={customValue} onInput={updateCustomValue} disabled={submitting} placeholder={copy.customPlaceholder} className="min-h-11 w-full border border-white/10 bg-black/20 px-3 py-3 text-sm text-white outline-none transition-colors placeholder:text-zinc-600 focus:border-indigo-400/60 disabled:opacity-50" data-testid={`guided-custom-input-${questionId}`} />}
                 <button type="button" onClick={() => onDraft(buildDecisionIntent(questionId, "custom", customValue))} disabled={submitting || !String(customValue || "").trim()} className="min-h-11 border border-indigo-500/40 px-4 text-xs font-semibold text-indigo-200 transition-colors hover:bg-indigo-500/10 disabled:cursor-not-allowed disabled:opacity-40" data-testid={`guided-custom-submit-${questionId}`}>{copy.useCustom}</button>
               </div>
             )}

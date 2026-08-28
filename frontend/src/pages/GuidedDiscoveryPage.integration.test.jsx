@@ -60,6 +60,31 @@ const nextQuestion = {
   allow_unknown: true,
 };
 
+const textareaQuestions = [
+  {
+    question_id: "target.users",
+    question: "Who are the target users?",
+    type: "textarea",
+    recommendations: [{ id: "target.users.product-manager", value: "Product Manager", label: "Product Manager", reason: "Common role", tradeoffs: [] }],
+    required: true,
+    category: "TARGET_USERS",
+    allow_custom: true,
+    allow_unknown: true,
+    allow_not_required: false,
+  },
+  {
+    question_id: "functionality.core",
+    question: "Which core capabilities are required?",
+    type: "textarea",
+    recommendations: [{ id: "functionality.core.ai-analysis", value: "AI analysis", label: "AI analysis", reason: "Core capability", tradeoffs: [] }],
+    required: true,
+    category: "CORE_FUNCTIONALITY",
+    allow_custom: true,
+    allow_unknown: true,
+    allow_not_required: false,
+  },
+];
+
 let roots = [];
 
 function snapshot({ activeIds = ["database.selection"], questions = [currentQuestion], status = "in_progress", readiness = "in_progress", gaps = ["technology"] } = {}) {
@@ -117,6 +142,12 @@ afterEach(() => {
   jest.clearAllMocks();
 });
 
+function typeIntoTextarea(element, value) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+  setter.call(element, value);
+  act(() => element.dispatchEvent(new Event("input", { bubbles: true })));
+}
+
 test("batch submits only valid drafts and rehydrates the next server snapshot", async () => {
   const response = snapshot({ activeIds: ["technology.backend"], questions: [currentQuestion, nextQuestion], readiness: "ready_for_review", gaps: [] });
   response.data.decisions = [{ question_id: "database.selection", value: "PostgreSQL", status: "CONFIRMED" }];
@@ -137,6 +168,34 @@ test("batch submits only valid drafts and rehydrates the next server snapshot", 
   expect(container.querySelector('[data-testid="guided-question-list"] [data-testid="guided-question-card-database.selection"]')).toBeNull();
   expect(container.querySelector('[data-testid="guided-question-card-database.selection"]')).toBeTruthy();
   expect(mockGetDiscoveryReview).toHaveBeenCalledTimes(2);
+});
+
+test("textarea recommendations and custom answers both work for target users and core functionality", async () => {
+  const response = snapshot({ activeIds: textareaQuestions.map((question) => question.question_id), questions: textareaQuestions });
+  mockSubmitGuidedDecisions.mockResolvedValue(snapshot({ activeIds: [], questions: [], status: "awaiting_confirmation", readiness: "ready_for_review", gaps: [] }));
+  const container = await mountPage(response);
+
+  expect(container.querySelector('[data-testid="guided-recommendation-target.users.product-manager"]')).toBeTruthy();
+  expect(container.querySelector('[data-testid="guided-recommendation-functionality.core.ai-analysis"]')).toBeTruthy();
+  const targetInput = container.querySelector('[data-testid="guided-custom-input-target.users"]');
+  const functionalityInput = container.querySelector('[data-testid="guided-custom-input-functionality.core"]');
+  typeIntoTextarea(targetInput, "Product manager and business analyst");
+  typeIntoTextarea(functionalityInput, "Document upload and review");
+
+  expect(targetInput.value).toBe("Product manager and business analyst");
+  expect(functionalityInput.value).toBe("Document upload and review");
+  expect(container.querySelector('[data-testid="guided-custom-submit-target.users"]').disabled).toBe(false);
+  expect(container.querySelector('[data-testid="guided-custom-submit-functionality.core"]').disabled).toBe(false);
+  expect(container.querySelector('[data-testid="guided-continue-btn"]').disabled).toBe(false);
+  act(() => container.querySelector('[data-testid="guided-continue-btn"]').click());
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+  expect(mockSubmitGuidedDecisions).toHaveBeenCalledWith("project-1", [
+    { question_id: "target.users", type: "custom", value: "Product manager and business analyst" },
+    { question_id: "functionality.core", type: "custom", value: "Document upload and review" },
+  ]);
+  expect(mockSubmitGuidedDecisions.mock.calls[0][1].filter((intent) => intent.question_id === "target.users")).toHaveLength(1);
+  expect(mockSubmitGuidedDecisions.mock.calls[0][1].filter((intent) => intent.question_id === "functionality.core")).toHaveLength(1);
 });
 
 test("duplicate continue clicks are blocked while batch request is pending", async () => {
