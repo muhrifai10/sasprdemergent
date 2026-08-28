@@ -25,6 +25,18 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from cryptography.fernet import Fernet, InvalidToken
 from templates_data import TEMPLATES
+from question_catalog import CATALOG_VERSION, get_question_template
+from user_decisions import (
+    UserDecision,
+    UserDecisionIntent,
+    canonical_decision_item,
+    current_decisions,
+    decision_snapshot,
+    decide,
+    decisions_to_legacy_answers,
+    effective_answers,
+    record_decision,
+)
 
 try:
     from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
@@ -571,6 +583,18 @@ def canonical_project_input(project: dict) -> tuple[dict, dict[str, dict]]:
         key = _D06_ANSWER_KEYS.get(answer.get("category"))
         if key:
             items[key] = answer
+    for raw_decision in (snapshot or {}).get("decisions", []):
+        decision_item = canonical_decision_item(raw_decision)
+        template = get_question_template(raw_decision.get("question_id", ""))
+        legacy_category = _GUIDED_TO_LEGACY_CATEGORY.get(template.category) if template else None
+        if legacy_category:
+            items[legacy_category] = {
+                "key": legacy_category,
+                "value": decision_item["value"],
+                "status": decision_item["status"],
+                "source": decision_item["source"],
+                "source_id": decision_item["source_id"],
+            }
     provenance = {}
     for key, field in _D06_SNAPSHOT_FIELDS.items():
         item = items.get(key) or {}
@@ -830,6 +854,35 @@ DISCOVERY_FIELD_MAP = {
     "ai_capability": "ai_capability",
     "document_input": "document_input",
 }
+_GUIDED_TO_LEGACY_CATEGORY = {
+    "PURPOSE": "business_goal",
+    "TARGET_USERS": "target_users",
+    "CORE_FUNCTIONALITY": "desired_features",
+    "ROLES_PERMISSIONS": "roles_permissions",
+    "WORKFLOW": "workflow",
+    "AUTHENTICATION": "auth_requirement",
+    "INVENTORY": "inventory",
+    "INTEGRATIONS": "integrations",
+    "STORAGE": "storage",
+    "CONSTRAINTS": "constraints",
+    "NON_GOALS": "non_goals",
+}
+
+
+def _guided_question_record(template) -> dict:
+    return {
+        "id": template.id,
+        "question": template.question,
+        "type": template.type,
+        "options": list(template.options),
+        "required": template.required,
+        "category": _GUIDED_TO_LEGACY_CATEGORY.get(template.category, template.category),
+        "catalog_category": template.category,
+        "reason": template.recommendation_reason,
+        "impact": "HIGH" if template.priority >= 80 else "MEDIUM",
+        "dependency": template.dependencies[0] if template.dependencies else None,
+        "catalog_version": template.catalog_version,
+    }
 
 DEFAULT_DISCOVERY_QUESTIONS = [
     {"id": "q_core_features", "question": "[PLACEHOLDER] Apa fitur inti produk ini?", "type": "text", "options": [],
@@ -971,7 +1024,7 @@ def blocking_discovery_categories(project: dict) -> list[str]:
     # Commerce products need an explicit transaction workflow and role boundary;
     # inventory is a discovery question until explicitly confirmed or declined.
     if check.get("category_status", {}).get("product_type") == "CONFIRMED" or infer_domain(project) == "commerce":
-        answers = _discovery(project).get("answers") or {}
+        answers = effective_answers(_discovery(project))
         answered_categories = {
             _d032_question_category(q.get("category"))
             for q in _discovery_questions(project)
@@ -1018,7 +1071,7 @@ def questions_cover_gaps(questions, blocking_categories: list[str]) -> bool:
 def discovery_analyzer_prompt(project: dict) -> str:
     disc = _discovery(project)
     blocking = blocking_discovery_categories(project)
-    answers = disc.get("answers") or {}
+    answers = effective_answers(disc)
     existing_q = disc.get("questions") or []
     answered_lines = []
     for q in existing_q:
@@ -1120,7 +1173,7 @@ def _answer_true(value: str) -> bool:
 
 def materialize_discovery_questions(ai_questions, disc: dict) -> list:
     existing = disc.get("questions") or []
-    answers = disc.get("answers") or {}
+    answers = effective_answers(disc)
     answered_categories = set()
     for q in existing:
         ans = answers.get(q.get("id"))
@@ -1229,7 +1282,7 @@ def _question_category(project: dict, qid: str) -> Optional[str]:
 def merge_discovery_answers(project: dict) -> dict:
     """Priority: CONFIRMED answer > existing project field. Never invents."""
     merged = dict(project)
-    answers = _discovery(project).get("answers") or {}
+    answers = effective_answers(_discovery(project))
     for qid, ans in answers.items():
         field = _question_category(project, qid)
         if not field:
@@ -1298,7 +1351,7 @@ _D04_STORAGE_RE = re.compile(r"\b(upload|unggah|document|dokumen|file|attachment
 def _discovery_category_status(project: dict, category: str) -> str:
     field = _D04_CATEGORY_FIELDS.get(category)
     question_category = _D04_QUESTION_CATEGORIES.get(category, category)
-    answers = _discovery(project).get("answers") or {}
+    answers = effective_answers(_discovery(project))
     for q in reversed(_discovery_questions(project)):
         if q.get("category") != question_category:
             continue
@@ -1372,7 +1425,7 @@ _D072_NEGATIVE_SCOPE_RE = r"no|not|tidak|tanpa|bukan|di luar|out of scope|tidak 
 def _d072_scope_text(project: dict) -> str:
     merged = merge_discovery_answers(project)
     values = [str(merged.get(field) or "") for field in _D04_CATEGORY_FIELDS.values()]
-    values.extend(str(answer.get("value") or "") for answer in (_discovery(project).get("answers") or {}).values())
+    values.extend(str(answer.get("value") or "") for answer in effective_answers(_discovery(project)).values())
     return " ".join(values).lower()
 
 
@@ -1476,7 +1529,7 @@ def completeness_check(project: dict) -> dict:
         active_blocking_categories.add("storage")
     question_categories = {question: semantic for semantic, question in _D04_QUESTION_CATEGORIES.items()}
     question_categories["desired_features"] = "core_functionality"
-    for qid, answer in (_discovery(project).get("answers") or {}).items():
+    for qid, answer in effective_answers(_discovery(project)).items():
         if answer.get("status") != "UNKNOWN":
             continue
         question = next((q for q in _discovery_questions(project) if q.get("id") == qid), {})
@@ -1529,7 +1582,7 @@ def completeness_check(project: dict) -> dict:
 
 def build_discovery_summary(project: dict) -> dict:
     merged = merge_discovery_answers(project)
-    answers = _discovery(project).get("answers") or {}
+    answers = effective_answers(_discovery(project))
 
     def field_state(field: str) -> dict:
         for qid, ans in answers.items():
@@ -1575,7 +1628,7 @@ _REVIEW_FIELDS = (
 
 
 def _review_item(project: dict, key: str, category: str, field: str, completeness: dict) -> dict:
-    answers = _discovery(project).get("answers") or {}
+    answers = effective_answers(_discovery(project))
     question_category = _D04_QUESTION_CATEGORIES.get(category, category)
     for question in reversed(_discovery_questions(project)):
         if question.get("category") != question_category:
@@ -1659,7 +1712,12 @@ def build_discovery_review(project: dict) -> dict:
         "non_goals": understanding["non_goals"],
         "readiness": completeness["readiness"],
         "confirmation_state": {"status": status, "confirmed_at": _discovery(project).get("confirmed_at"),
-                                "snapshot_available": bool(confirmation_snapshot)},
+                                 "snapshot_available": bool(confirmation_snapshot)},
+        "user_decisions": [item.model_dump() for item in current_decisions(_discovery(project))],
+        "decision_history": [
+            item.model_dump() if isinstance(item, UserDecision) else UserDecision.model_validate(item)
+            for item in _discovery(project).get("decision_history", [])
+        ],
     }
     return {
         "review": review,
@@ -1685,9 +1743,10 @@ def _invalidate_discovery_confirmation(project: dict) -> None:
 
 def _snapshot_discovery_answers(project: dict) -> dict:
     snapshot = {}
+    answers = effective_answers(_discovery(project))
     for q in _discovery_questions(project):
         qid = q.get("id")
-        answer = (_discovery(project).get("answers") or {}).get(qid)
+        answer = answers.get(qid)
         if answer is None:
             continue
         copied = deepcopy(answer)
@@ -1775,12 +1834,23 @@ async def discovery_review(project_id: str, user: dict = Depends(get_current_use
     return build_discovery_review(project)
 
 
+def _guided_domain(project: dict) -> str:
+    product_type = str(project.get("product_type") or "").strip().casefold()
+    domains = {"pos": "POS", "saas": "SaaS", "e-commerce": "E-Commerce", "ecommerce": "E-Commerce",
+               "ai saas": "AI SaaS", "generic": "Generic", "internal tool": "Internal Tool", "cms": "CMS"}
+    if product_type in domains:
+        return domains[product_type]
+    return "E-Commerce" if infer_domain(project) == "commerce" else "Generic"
+
+
 @api_router.post("/projects/{project_id}/discovery/answers")
 async def discovery_answers(project_id: str, body: DiscoveryAnswersRequest, user: dict = Depends(get_current_user)):
     project = await _load_owned_project(project_id, user)
     if project.get("discovery_status") in (None, "none"):
         raise HTTPException(status_code=409, detail="Discovery belum dimulai. Jalankan analyze terlebih dahulu.")
     disc = _discovery(project)
+    if "decisions" in disc:
+        raise HTTPException(status_code=409, detail="Guided discovery menggunakan endpoint decisions.")
     previous_gaps = blocking_discovery_categories(project)
     qids = {q.get("id") for q in _discovery_questions(project)}
     answers = dict(disc.get("answers") or {})
@@ -1811,6 +1881,49 @@ async def discovery_answers(project_id: str, body: DiscoveryAnswersRequest, user
         project["discovery_status"] = transition_discovery_status("awaiting_confirmation", "in_progress")
     await _save_discovery(project_id, user, project)
     return {"discovery_status": project["discovery_status"], "answers": answers, "completeness": check}
+
+
+@api_router.post("/projects/{project_id}/discovery/decisions")
+async def discovery_decisions(project_id: str, body: UserDecisionIntent, user: dict = Depends(get_current_user)):
+    project = await _load_owned_project(project_id, user)
+    if project.get("discovery_status") in (None, "none"):
+        project["discovery_status"] = transition_discovery_status("none", "in_progress")
+    disc = _discovery(project)
+    try:
+        decision = decide(
+            body,
+            domain=_guided_domain(project),
+            actor_id=user["user_id"],
+            current_decisions=current_decisions(disc),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    current, history = record_decision(
+        current_decisions(disc), disc.get("decision_history", []), decision,
+    )
+    disc["mode"] = "guided"
+    disc["decisions"] = [item.model_dump() for item in current]
+    disc["decision_history"] = [item.model_dump() for item in history]
+    disc["catalog_version"] = CATALOG_VERSION
+    template = get_question_template(decision.question_id)
+    if not any(question.get("id") == decision.question_id for question in disc.get("questions", [])):
+        disc.setdefault("questions", []).append(_guided_question_record(template))
+    disc["answers"] = decisions_to_legacy_answers(current)
+    check = completeness_check(project)
+    if project.get("discovery_status") == "in_progress" and check["complete"]:
+        project["discovery_status"] = transition_discovery_status("in_progress", "awaiting_confirmation")
+    elif project.get("discovery_status") == "awaiting_confirmation" and not check["complete"]:
+        project["discovery_status"] = transition_discovery_status("awaiting_confirmation", "in_progress")
+    await _save_discovery(project_id, user, project)
+    return {
+        "discovery_status": project["discovery_status"],
+        "decision": decision.model_dump(),
+        "decisions": [item.model_dump() for item in current],
+        "decision_history": [item.model_dump() for item in history],
+        "answers": disc["answers"],
+        "completeness": check,
+    }
 
 
 @api_router.post("/projects/{project_id}/discovery/confirm")
@@ -1848,6 +1961,8 @@ async def discovery_confirm(project_id: str, user: dict = Depends(get_current_us
         "status": "confirmed",
         "confirmed_at": disc["confirmed_at"],
     }
+    if "decisions" in _discovery(project):
+        snapshot.update(decision_snapshot(_discovery(project)))
     snapshots = list(disc.get("confirmation_snapshots") or [])
     snapshots.append(snapshot)
     disc["confirmation_snapshots"] = snapshots
